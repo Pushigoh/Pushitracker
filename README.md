@@ -15,9 +15,6 @@ Needs Go 1.27+.
 ```
 build.bat
 ```
-
-To change the exe's icon, replace `winres/icon.png` and run `go generate`.
-
 ## Folders
 
 Put these next to `pushitracker.exe`:
