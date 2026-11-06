@@ -32,9 +32,3 @@ games/
 settings/
 ```
 
-## Run
-
-1. Run `pushitracker.exe`.
-2. Pick a character and a game, then press **Start**.
-
-Folders that aren't next to the exe can be chosen with **Browse…**.
