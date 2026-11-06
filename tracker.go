@@ -133,6 +133,16 @@ func (s *iconState) advance(now time.Time) {
 	}
 }
 
+// clear turns the icon back to not collected, fading to grey.
+func (s *iconState) clear(now time.Time) {
+	if s.stage < 0 {
+		return
+	}
+	s.fadeFrom, _ = s.colorAmount(now)
+	s.fadeStart = now
+	s.stage = -1
+}
+
 func (s *iconState) shownStage() int { return max(s.stage, 0) }
 
 // sizeControl is one "label [field] px" + slider block in the settings panel.
@@ -495,9 +505,6 @@ func (t *Tracker) Render(now time.Time) (*image.RGBA, time.Time) {
 		if fading {
 			wake(now.Add(16 * time.Millisecond))
 		}
-		if t.pressed == i {
-			amount = 1 // show full colour while the icon is held down
-		}
 		if amount < 1 {
 			drawImage(img, r.Min, s.grays[k], 1)
 		}
@@ -779,6 +786,18 @@ func (t *Tracker) MouseUp(surf Surface, p image.Point, now time.Time) {
 	}
 	// One shared deadline: a new click restarts the display timer.
 	t.resetAt = now.Add(time.Duration(t.settings.DisplaySeconds) * time.Second)
+}
+
+// RightClick turns the icon at p back to grey (not collected), without
+// changing what the character and item display show. It reports whether the
+// overlay needs redrawing.
+func (t *Tracker) RightClick(s Surface, p image.Point, now time.Time) bool {
+	h := t.hitAt(s, p)
+	if s != SurfMain || h.kind != hitIcon || t.icons[h.idx].stage < 0 {
+		return false
+	}
+	t.icons[h.idx].clear(now)
+	return true
 }
 
 // CaptureLost is called when the window loses the mouse mid-press.

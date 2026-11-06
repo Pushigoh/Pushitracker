@@ -84,6 +84,7 @@ const (
 	wmMouseMove    = 0x0200
 	wmLButtonDown  = 0x0201
 	wmLButtonUp    = 0x0202
+	wmRButtonDown  = 0x0204
 	wmMouseWheel   = 0x020A
 	wmCaptureChg   = 0x0215
 	wmExitSizeMove = 0x0232
@@ -495,6 +496,14 @@ func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (u
 			return 0, true
 		}
 		o.render()
+	case wmRButtonDown:
+		// Only on the tracker itself, not the character or item over it.
+		if s == SurfMain && o.partAt(lParamPoint(lParam)) != partTracker {
+			break
+		}
+		if o.t.RightClick(s, lParamPoint(lParam).Sub(off), now) {
+			o.render()
+		}
 	case wmLButtonUp:
 		o.t.MouseUp(s, lParamPoint(lParam).Sub(off), now)
 		pReleaseCapture.Call()
