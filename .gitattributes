@@ -1,0 +1,7 @@
+# Normalise line endings: LF in the repo, CRLF only where Windows needs it.
+* text=auto eol=lf
+*.bat text eol=crlf
+
+*.png binary
+*.ico binary
+*.syso binary
