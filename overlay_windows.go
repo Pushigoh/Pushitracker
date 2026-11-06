@@ -160,6 +160,7 @@ type layered struct {
 	bitmap  uintptr
 	bits    unsafe.Pointer
 	bmpSize image.Point
+	shown   *image.RGBA // the image last pushed
 }
 
 type overlay struct {
@@ -753,12 +754,14 @@ func (o *overlay) followResize() {
 }
 
 // push copies img into the window's bitmap and shows it. The window keeps its
-// top-left corner and takes img's size.
+// top-left corner and takes img's size. Pushing the image already shown, such
+// as an animation frame that hasn't changed, does nothing.
 func (w *layered) push(img *image.RGBA) {
 	sz := img.Rect.Size()
-	if sz.X <= 0 || sz.Y <= 0 || !w.ensureBitmap(sz) {
+	if img == w.shown || sz.X <= 0 || sz.Y <= 0 || !w.ensureBitmap(sz) {
 		return
 	}
+	w.shown = img
 	// image.RGBA is premultiplied RGBA; the DIB wants premultiplied BGRA.
 	dst := unsafe.Slice((*byte)(w.bits), sz.X*sz.Y*4)
 	src := img.Pix
@@ -798,7 +801,7 @@ func (w *layered) free() {
 	if w.memDC != 0 {
 		pDeleteDC.Call(w.memDC)
 	}
-	w.bitmap, w.memDC, w.bits = 0, 0, nil
+	w.bitmap, w.memDC, w.bits, w.shown = 0, 0, nil, nil
 }
 
 // useDarkTitleBar asks Windows 10 20H1+ / 11 to draw a window's title bar dark.
