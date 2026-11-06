@@ -11,6 +11,18 @@ import (
 	"gioui.org/app"
 )
 
+// version is stamped in by build.bat (e.g. "v1.0.0"); a plain go build
+// leaves it empty.
+var version string
+
+// appName is the name shown in window titles, with the version if known.
+func appName() string {
+	if version == "" {
+		return "Pushitracker"
+	}
+	return "Pushitracker " + version
+}
+
 func main() {
 	go func() {
 		th := newDarkTheme()

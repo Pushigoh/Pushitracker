@@ -8,10 +8,8 @@
 Thumbs.db
 .DS_Store
 
-# Tracker data kept beside the exe
+# Local files
 /characters/
 /games/
 /settings/
-
-# Local-only tests
-/scan_test.go
+*_test.go
