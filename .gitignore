@@ -12,3 +12,6 @@ Thumbs.db
 /characters/
 /games/
 /settings/
+
+# Local-only tests
+/scan_test.go
