@@ -481,7 +481,7 @@ func (t *Tracker) RenderPanel(now time.Time) (*image.RGBA, time.Time) {
 }
 
 // RenderItem draws the item display (the clicked item's gif, or the game's
-// idle image) for its own window.
+// idle image) on its own; the window places it.
 // The returned image may be a cached frame, so it must not be changed.
 func (t *Tracker) RenderItem(now time.Time) (*image.RGBA, time.Time) {
 	t.tick(now)
@@ -494,7 +494,7 @@ func (t *Tracker) RenderItem(now time.Time) (*image.RGBA, time.Time) {
 	return t.animFrame(path, t.ItemSize(), start, until, now)
 }
 
-// RenderCharacter draws the character on its own, for its separate window.
+// RenderCharacter draws the character on its own; the window places it.
 // The returned image may be a cached frame, so it must not be changed.
 func (t *Tracker) RenderCharacter(now time.Time) (*image.RGBA, time.Time) {
 	t.tick(now)
