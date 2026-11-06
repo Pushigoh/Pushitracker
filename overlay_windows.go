@@ -12,13 +12,15 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// The tracker is a few borderless layered windows updated with
+// The tracker is a borderless layered window updated with
 // UpdateLayeredWindow, which gives true per-pixel transparency: the desktop
-// shows through wherever they are transparent, and clicks there pass through
-// to what's behind. The character, the item display above its head and the
-// settings panel each have their own window, owned by the tracker window, so
-// they can be dragged anywhere on their own. The item follows the character
-// when the character moves or is resized; everything follows the grip.
+// shows through wherever it is transparent, and clicks there pass through to
+// what's behind. The icons, the character and the item display above its
+// head are all drawn in this one window, so capturing it (in OBS, say) shows
+// all of them. Each can still be dragged on its own: the window grows to
+// cover wherever they are. The item follows the character when the character
+// moves or is resized; everything follows the grip. The settings panel has a
+// window of its own, owned by the tracker window.
 
 var (
 	user32 = windows.NewLazySystemDLL("user32.dll")
@@ -47,6 +49,7 @@ var (
 	pSetWindowPos                 = user32.NewProc("SetWindowPos")
 	pGetWindowRect                = user32.NewProc("GetWindowRect")
 	pUpdateLayeredWindow          = user32.NewProc("UpdateLayeredWindow")
+	pUpdateLayeredWindowIndirect  = user32.NewProc("UpdateLayeredWindowIndirect")
 	pGetDpiForWindow              = user32.NewProc("GetDpiForWindow")
 	pSetThreadDpiAwarenessContext = user32.NewProc("SetThreadDpiAwarenessContext")
 	pMonitorFromPoint             = user32.NewProc("MonitorFromPoint")
@@ -153,6 +156,19 @@ type blendFunction struct {
 	op, flags, constantAlpha, alphaFormat byte
 }
 
+type updateLayeredWindowInfo struct {
+	size     uint32
+	dst      uintptr
+	pptDst   *point
+	psize    *size
+	src      uintptr
+	pptSrc   *point
+	key      uint32
+	pblend   *blendFunction
+	flags    uint32
+	prcDirty *rect
+}
+
 // layered is one per-pixel-alpha window and the bitmap it is drawn from.
 type layered struct {
 	hwnd    uintptr
@@ -163,23 +179,42 @@ type layered struct {
 	shown   *image.RGBA // the image last pushed
 }
 
+// The parts drawn in the tracker window, bottom to top.
+const (
+	partTracker = iota // the icons and the bar above them
+	partChar
+	partItem
+	numParts
+)
+
 type overlay struct {
 	t     *Tracker
-	main  layered
-	char  layered
-	item  layered
+	main  layered // the tracker, character and item
 	panel layered
-	// When each window (main, character, item, panel) next needs redrawing;
-	// zero when it is still until the next input.
-	due      [4]time.Time
-	mainLast point // where the tracker window was, to move the character with it
+	// When each of the tracker, character, item and settings panel next needs
+	// redrawing; zero when it is still until the next input.
+	due [4]time.Time
+
+	// Each part's latest picture, and where it is on screen.
+	parts [numParts]*image.RGBA
+	at    [numParts]point
+	// Where the tracker window is on screen and its size, as last set, and
+	// the area (on screen) that needs drawing again.
+	origin  point
+	winSize image.Point
+	dirty   image.Rectangle
 
 	// Where the item sits relative to the character's top-left corner. It is
 	// kept unrounded so it scales exactly as the character is resized.
-	itemOff    [2]float64
-	charH      int // character and item heights last drawn, to spot resizes
-	itemPx     int
-	itemPlaced bool // itemOff is set and the item may follow the character
+	itemOff [2]float64
+	charH   int // character and item heights last drawn, to spot resizes
+	itemPx  int
+
+	// The character or item being dragged (-1 for none), where the cursor
+	// was when the drag started and where the part was.
+	dragPart  int
+	dragFrom  point
+	dragStart point
 
 	// Where the settings panel sits relative to the tracker, once it has been
 	// opened or loaded from the settings file.
@@ -215,7 +250,7 @@ func runTracker(t *Tracker) {
 		pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 	})
 
-	o := &overlay{t: t}
+	o := &overlay{t: t, dragPart: -1}
 	current = o
 	defer func() { current = nil }()
 
@@ -232,39 +267,30 @@ func runTracker(t *Tracker) {
 	if o.main.hwnd == 0 {
 		return
 	}
-	o.mainLast = point{x, y}
+	o.origin = point{x, y}
 	dpi, _, _ := pGetDpiForWindow.Call(o.main.hwnd)
 	if dpi == 0 {
 		dpi = 96
 	}
 	t.SetScale(float64(dpi) / 96)
 
-	// The character starts under the item display until it has been dragged.
-	cx, cy := screenPosition(t.gs.CharPos, func() (int32, int32) {
+	// The character starts under the item display, and the item under the
+	// icons, until they have been dragged.
+	o.at[partTracker] = point{x, y}
+	o.at[partChar].x, o.at[partChar].y = screenPosition(t.gs.CharPos, func() (int32, int32) {
 		off := t.CharacterOffset()
 		return x + int32(off.X), y + int32(off.Y)
 	})
-	// Owned by the tracker window: it stays above it, has no taskbar button
-	// of its own, and closes with it.
-	charTitle := windows.StringToUTF16Ptr("Pushitracker character")
-	o.char.hwnd, _, _ = pCreateWindowExW.Call(
-		wsExLayered|wsExToolWindow,
-		uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(charTitle)),
-		wsPopup, uintptr(cx), uintptr(cy), 100, 100, o.main.hwnd, 0, uintptr(instance), 0)
-
 	ix, iy := screenPosition(t.gs.ItemPos, func() (int32, int32) {
 		off := t.ItemOffset()
 		return x + int32(off.X), y + int32(off.Y)
 	})
-	itemTitle := windows.StringToUTF16Ptr("Pushitracker item")
-	o.item.hwnd, _, _ = pCreateWindowExW.Call(
-		wsExLayered|wsExToolWindow,
-		uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(itemTitle)),
-		wsPopup, uintptr(ix), uintptr(iy), 100, 100, o.main.hwnd, 0, uintptr(instance), 0)
-	o.itemOff = [2]float64{float64(ix - cx), float64(iy - cy)}
-	o.itemPlaced = o.char.hwnd != 0 && o.item.hwnd != 0
+	o.itemOff = [2]float64{float64(ix - o.at[partChar].x), float64(iy - o.at[partChar].y)}
+	o.at[partItem] = point{ix, iy}
 
-	// The settings panel starts hidden; draw shows it while it is open.
+	// The settings panel starts hidden; draw shows it while it is open. It is
+	// owned by the tracker window: it stays above it, has no taskbar button of
+	// its own, and closes with it.
 	if px, py, ok := savedPosition(t.gs.PanelPos); ok {
 		o.panelOff, o.panelOffSet = point{px - x, py - y}, true
 	}
@@ -277,11 +303,6 @@ func runTracker(t *Tracker) {
 	o.render()
 	o.applyTopmost()
 	pShowWindow.Call(o.main.hwnd, swShow)
-	for _, h := range []uintptr{o.char.hwnd, o.item.hwnd} {
-		if h != 0 {
-			pShowWindow.Call(h, swShowNA)
-		}
-	}
 
 	var m msg
 	for {
@@ -293,8 +314,6 @@ func runTracker(t *Tracker) {
 		pDispatchMessageW.Call(uintptr(unsafe.Pointer(&m)))
 	}
 	o.main.free()
-	o.char.free()
-	o.item.free()
 	o.panel.free()
 }
 
@@ -325,14 +344,6 @@ func wndProc(hwnd, message, wParam, lParam uintptr) uintptr {
 			if r, ok := o.mainProc(message, wParam, lParam); ok {
 				return r
 			}
-		case o.char.hwnd:
-			if r, ok := o.charProc(message, wParam, lParam); ok {
-				return r
-			}
-		case o.item.hwnd:
-			if r, ok := o.itemProc(message, wParam, lParam); ok {
-				return r
-			}
 		case o.panel.hwnd:
 			if r, ok := o.panelProc(message, wParam, lParam); ok {
 				return r
@@ -359,6 +370,47 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 		pDestroyWindow.Call(hwnd)
 	case wmDestroy:
 		pPostQuitMessage.Call(0)
+	case wmLButtonDown:
+		p := o.partAt(lParamPoint(lParam))
+		if p != partChar && p != partItem {
+			return o.inputProc(SurfMain, hwnd, message, wParam, lParam)
+		}
+		// Dragging the character brings the item along; dragging the item
+		// moves just the item.
+		o.dragPart, o.dragFrom, o.dragStart = p, cursorPos(), o.at[p]
+		pSetCapture.Call(hwnd)
+	case wmMouseMove:
+		if o.dragPart < 0 {
+			return o.inputProc(SurfMain, hwnd, message, wParam, lParam)
+		}
+		c := cursorPos()
+		to := point{o.dragStart.x + c.x - o.dragFrom.x, o.dragStart.y + c.y - o.dragFrom.y}
+		if o.dragPart == partChar {
+			o.moveChar(to)
+		} else {
+			o.movePart(partItem, to)
+		}
+		o.compose()
+	case wmLButtonUp, wmCaptureChg:
+		if o.dragPart < 0 {
+			return o.inputProc(SurfMain, hwnd, message, wParam, lParam)
+		}
+		if o.dragPart == partItem {
+			o.measureItemOffset()
+		}
+		o.dragPart = -1
+		if message == wmLButtonUp {
+			pReleaseCapture.Call()
+		}
+	case wmSetCursor:
+		if lParam&0xffff != htClient {
+			return 0, false
+		}
+		if p := o.partAt(clientPoint(hwnd, cursorPos())); p == partChar || p == partItem {
+			setCursor(idcSizeAll)
+			return 1, true
+		}
+		return o.inputProc(SurfMain, hwnd, message, wParam, lParam)
 	default:
 		return o.inputProc(SurfMain, hwnd, message, wParam, lParam)
 	}
@@ -382,20 +434,31 @@ func (o *overlay) panelProc(message, wParam, lParam uintptr) (uintptr, bool) {
 // the tracker, and carries out what it asks for.
 func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (uintptr, bool) {
 	now := time.Now()
+	// Points in the tracker window are moved to the tracker part's own
+	// coordinates.
+	var off image.Point
+	if s == SurfMain {
+		off = image.Pt(int(o.at[partTracker].x-o.origin.x), int(o.at[partTracker].y-o.origin.y))
+	}
 	switch message {
 	case wmLButtonDown:
-		switch o.t.MouseDown(s, lParamPoint(lParam), now) {
+		switch o.t.MouseDown(s, lParamPoint(lParam).Sub(off), now) {
 		case ActDrag:
-			// Windows runs the move. Moving the tracker brings the others
-			// along (see followMain); moving the panel moves just the panel.
+			// Windows runs the move. Moving the tracker window brings
+			// everything along (see followMain); moving the panel moves just
+			// the panel.
 			pReleaseCapture.Call()
 			pSendMessageW.Call(hwnd, wmNCLButtonDn, htCaption, 0)
 		case ActSave:
-			o.recordPosition(o.main.hwnd, &o.t.gs.TrackerPos)
-			o.recordPosition(o.char.hwnd, &o.t.gs.CharPos)
-			o.recordPosition(o.item.hwnd, &o.t.gs.ItemPos)
+			g := o.t.gs
+			g.TrackerPos = savePoint(o.at[partTracker])
+			g.CharPos = savePoint(o.at[partChar])
+			g.ItemPos = savePoint(o.at[partItem])
 			if o.panelShown {
-				o.recordPosition(o.panel.hwnd, &o.t.gs.PanelPos)
+				var r rect
+				if ok, _, _ := pGetWindowRect.Call(o.panel.hwnd, uintptr(unsafe.Pointer(&r))); ok != 0 {
+					g.PanelPos = savePoint(point{r.left, r.top})
+				}
 			}
 			o.t.SaveGame()
 		case ActReset:
@@ -413,22 +476,21 @@ func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (u
 		}
 		o.render()
 	case wmLButtonUp:
-		o.t.MouseUp(s, lParamPoint(lParam), now)
+		o.t.MouseUp(s, lParamPoint(lParam).Sub(off), now)
 		pReleaseCapture.Call()
 		o.render()
 	case wmCaptureChg:
 		o.t.CaptureLost()
 		o.render()
 	case wmMouseMove:
-		if o.t.MouseMove(lParamPoint(lParam)) {
+		if o.t.MouseMove(lParamPoint(lParam).Sub(off)) {
 			o.render()
 		}
 	case wmMouseWheel:
 		// Wheel positions are in screen coordinates.
 		p := point{int32(int16(lParam & 0xffff)), int32(int16((lParam >> 16) & 0xffff))}
-		pScreenToClient.Call(hwnd, uintptr(unsafe.Pointer(&p)))
 		notches := int(int16((wParam>>16)&0xffff)) / 120
-		if o.t.Wheel(s, image.Pt(int(p.x), int(p.y)), notches) {
+		if o.t.Wheel(s, clientPoint(hwnd, p).Sub(off), notches) {
 			o.render()
 		}
 	case wmKeyDown:
@@ -448,11 +510,8 @@ func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (u
 		if lParam&0xffff != htClient {
 			return 0, false
 		}
-		var p point
-		pGetCursorPos.Call(uintptr(unsafe.Pointer(&p)))
-		pScreenToClient.Call(hwnd, uintptr(unsafe.Pointer(&p)))
 		id := uintptr(idcArrow)
-		switch o.t.Cursor(s, image.Pt(int(p.x), int(p.y))) {
+		switch o.t.Cursor(s, clientPoint(hwnd, cursorPos()).Sub(off)) {
 		case hitDrag, hitPanel:
 			id = idcSizeAll
 		case hitIcon, hitGear, hitSlider, hitOnTop, hitSave, hitReset, hitChangeGame, hitExit:
@@ -468,67 +527,79 @@ func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (u
 	return 0, true
 }
 
-// charProc handles the character window: click and hold anywhere visible on
-// the character to drag it, and the item above its head comes along.
-func (o *overlay) charProc(message, wParam, lParam uintptr) (uintptr, bool) {
-	switch message {
-	case wmMove:
-		o.placeItem()
-	default:
-		return o.dragProc(o.char.hwnd, message, lParam)
-	}
-	return 0, true
-}
-
-// itemProc handles the item display window: dragging it moves only the item,
-// and it keeps its new place relative to the character.
-func (o *overlay) itemProc(message, wParam, lParam uintptr) (uintptr, bool) {
-	switch message {
-	case wmExitSizeMove:
-		o.measureItemOffset()
-	default:
-		return o.dragProc(o.item.hwnd, message, lParam)
-	}
-	return 0, true
-}
-
-// dragProc is what the character and item windows share: click and hold to
-// drag, a move cursor, and Alt+F4 closing the whole tracker.
-func (o *overlay) dragProc(hwnd, message, lParam uintptr) (uintptr, bool) {
-	switch message {
-	case wmLButtonDown:
-		pReleaseCapture.Call()
-		pSendMessageW.Call(hwnd, wmNCLButtonDn, htCaption, 0)
-	case wmSetCursor:
-		if lParam&0xffff != htClient {
-			return 0, false
+// partAt returns the topmost part with a visible pixel at p, in tracker
+// window coordinates, or -1 if there is none.
+func (o *overlay) partAt(p image.Point) int {
+	sp := image.Pt(p.X+int(o.origin.x), p.Y+int(o.origin.y))
+	for i := numParts - 1; i >= 0; i-- {
+		img := o.parts[i]
+		if img == nil {
+			continue
 		}
-		setCursor(idcSizeAll)
-		return 1, true
-	case wmClose:
-		pDestroyWindow.Call(o.main.hwnd)
-	default:
-		return 0, false
+		q := sp.Sub(image.Pt(int(o.at[i].x), int(o.at[i].y)))
+		if q.In(img.Rect) && img.Pix[img.PixOffset(q.X, q.Y)+3] != 0 {
+			return i
+		}
 	}
-	return 0, true
+	return -1
+}
+
+// partRect is where part i is on screen.
+func (o *overlay) partRect(i int) image.Rectangle {
+	if o.parts[i] == nil {
+		return image.Rectangle{}
+	}
+	tl := image.Pt(int(o.at[i].x), int(o.at[i].y))
+	return image.Rectangle{Min: tl, Max: tl.Add(o.parts[i].Rect.Size())}
+}
+
+// setPart gives part i a new picture.
+func (o *overlay) setPart(i int, img *image.RGBA) {
+	if img == o.parts[i] {
+		return
+	}
+	o.dirty = o.dirty.Union(o.partRect(i))
+	o.parts[i] = img
+	o.dirty = o.dirty.Union(o.partRect(i))
+}
+
+// movePart moves part i to p on screen.
+func (o *overlay) movePart(i int, p point) {
+	if p == o.at[i] {
+		return
+	}
+	o.dirty = o.dirty.Union(o.partRect(i))
+	o.at[i] = p
+	o.dirty = o.dirty.Union(o.partRect(i))
+}
+
+// moveChar moves the character to p, and the item with it.
+func (o *overlay) moveChar(p point) {
+	o.movePart(partChar, p)
+	o.placeItem()
+}
+
+// placeItem puts the item at its offset from the character.
+func (o *overlay) placeItem() {
+	c := o.at[partChar]
+	o.movePart(partItem, point{c.x + int32(math.Round(o.itemOff[0])), c.y + int32(math.Round(o.itemOff[1]))})
+}
+
+// measureItemOffset records where the item now is relative to the character.
+func (o *overlay) measureItemOffset() {
+	c, i := o.at[partChar], o.at[partItem]
+	o.itemOff = [2]float64{float64(i.x - c.x), float64(i.y - c.y)}
 }
 
 // resetPositions moves the character and item back to where they start,
 // relative to the tracker, at their (just reset) sizes.
 func (o *overlay) resetPositions() {
-	var m rect
-	if ok, _, _ := pGetWindowRect.Call(o.main.hwnd, uintptr(unsafe.Pointer(&m))); ok == 0 {
-		return
-	}
 	co, io := o.t.CharacterOffset(), o.t.ItemOffset()
 	o.itemOff = [2]float64{float64(io.X - co.X), float64(io.Y - co.Y)}
 	// Already at the new sizes, so followResize leaves the offset alone.
 	o.charH, o.itemPx = o.t.CharacterSize().Y, o.t.ItemSize().Y
-	if o.char.hwnd != 0 {
-		// The character's wmMove brings the item along.
-		pSetWindowPos.Call(o.char.hwnd, 0, uintptr(m.left+int32(co.X)), uintptr(m.top+int32(co.Y)), 0, 0, swpNoSize|swpNoZOrder|swpNoActivate)
-	}
-	o.placeItem()
+	m := o.at[partTracker]
+	o.moveChar(point{m.x + int32(co.X), m.y + int32(co.Y)})
 	o.panelOffSet = false
 	if o.panelShown {
 		o.placePanel()
@@ -542,73 +613,55 @@ func (o *overlay) placePanel() {
 		off := o.t.PanelOffset()
 		o.panelOff, o.panelOffSet = point{int32(off.X), int32(off.Y)}, true
 	}
-	var m rect
-	if ok, _, _ := pGetWindowRect.Call(o.main.hwnd, uintptr(unsafe.Pointer(&m))); ok == 0 {
-		return
-	}
-	pSetWindowPos.Call(o.panel.hwnd, 0, uintptr(m.left+o.panelOff.x), uintptr(m.top+o.panelOff.y), 0, 0, swpNoSize|swpNoZOrder|swpNoActivate)
+	m := o.at[partTracker]
+	pSetWindowPos.Call(o.panel.hwnd, 0, uintptr(m.x+o.panelOff.x), uintptr(m.y+o.panelOff.y), 0, 0, swpNoSize|swpNoZOrder|swpNoActivate)
 }
 
 // measurePanelOffset records where the panel was dragged to, relative to the
 // tracker, so it opens there again and follows the grip.
 func (o *overlay) measurePanelOffset() {
-	var m, p rect
-	ok1, _, _ := pGetWindowRect.Call(o.main.hwnd, uintptr(unsafe.Pointer(&m)))
-	ok2, _, _ := pGetWindowRect.Call(o.panel.hwnd, uintptr(unsafe.Pointer(&p)))
-	if ok1 != 0 && ok2 != 0 {
-		o.panelOff, o.panelOffSet = point{p.left - m.left, p.top - m.top}, true
+	var p rect
+	if ok, _, _ := pGetWindowRect.Call(o.panel.hwnd, uintptr(unsafe.Pointer(&p))); ok != 0 {
+		m := o.at[partTracker]
+		o.panelOff, o.panelOffSet = point{p.left - m.x, p.top - m.y}, true
 	}
 }
 
-// placeItem puts the item at its offset from the character.
-func (o *overlay) placeItem() {
-	if !o.itemPlaced {
-		return
-	}
-	var c rect
-	if ok, _, _ := pGetWindowRect.Call(o.char.hwnd, uintptr(unsafe.Pointer(&c))); ok == 0 {
-		return
-	}
-	x := c.left + int32(math.Round(o.itemOff[0]))
-	y := c.top + int32(math.Round(o.itemOff[1]))
-	pSetWindowPos.Call(o.item.hwnd, 0, uintptr(x), uintptr(y), 0, 0, swpNoSize|swpNoZOrder|swpNoActivate)
-}
-
-// measureItemOffset records where the item now is relative to the character.
-func (o *overlay) measureItemOffset() {
-	if !o.itemPlaced {
-		return
-	}
-	var c, i rect
-	ok1, _, _ := pGetWindowRect.Call(o.char.hwnd, uintptr(unsafe.Pointer(&c)))
-	ok2, _, _ := pGetWindowRect.Call(o.item.hwnd, uintptr(unsafe.Pointer(&i)))
-	if ok1 != 0 && ok2 != 0 {
-		o.itemOff = [2]float64{float64(i.left - c.left), float64(i.top - c.top)}
-	}
-}
-
-// followMain moves the character by however far the tracker window just
-// moved, so dragging the grip carries both. Dragging the character itself
-// moves only the character.
+// followMain keeps track of the tracker window being dragged by the grip:
+// everything in it moves with it, and so does the settings panel.
 func (o *overlay) followMain() {
 	var r rect
 	if ok, _, _ := pGetWindowRect.Call(o.main.hwnd, uintptr(unsafe.Pointer(&r))); ok == 0 {
 		return
 	}
-	dx, dy := r.left-o.mainLast.x, r.top-o.mainLast.y
-	o.mainLast = point{r.left, r.top}
+	dx, dy := r.left-o.origin.x, r.top-o.origin.y
+	if dx == 0 && dy == 0 {
+		return
+	}
+	o.origin = point{r.left, r.top}
+	for i := range o.at {
+		o.at[i].x += dx
+		o.at[i].y += dy
+	}
+	o.dirty = o.dirty.Add(image.Pt(int(dx), int(dy)))
 	if o.panelShown {
 		o.placePanel()
 	}
-	if (dx == 0 && dy == 0) || o.char.hwnd == 0 {
-		return
-	}
-	var c rect
-	if ok, _, _ := pGetWindowRect.Call(o.char.hwnd, uintptr(unsafe.Pointer(&c))); ok == 0 {
-		return
-	}
-	pSetWindowPos.Call(o.char.hwnd, 0, uintptr(c.left+dx), uintptr(c.top+dy), 0, 0, swpNoSize|swpNoZOrder|swpNoActivate)
 }
+
+func cursorPos() point {
+	var p point
+	pGetCursorPos.Call(uintptr(unsafe.Pointer(&p)))
+	return p
+}
+
+// clientPoint converts a screen point to hwnd's client coordinates.
+func clientPoint(hwnd uintptr, p point) image.Point {
+	pScreenToClient.Call(hwnd, uintptr(unsafe.Pointer(&p)))
+	return image.Pt(int(p.x), int(p.y))
+}
+
+func savePoint(p point) *[2]int { return &[2]int{int(p.x), int(p.y)} }
 
 func setCursor(id uintptr) {
 	c, _, _ := pLoadCursorW.Call(0, id)
@@ -624,33 +677,21 @@ func (o *overlay) applyTopmost() {
 	if o.t.gs.AlwaysOnTop {
 		after = ^uintptr(0) // HWND_TOPMOST
 	}
-	for _, h := range []uintptr{o.main.hwnd, o.char.hwnd, o.item.hwnd, o.panel.hwnd} {
+	for _, h := range []uintptr{o.main.hwnd, o.panel.hwnd} {
 		if h != 0 {
 			pSetWindowPos.Call(h, after, 0, 0, 0, 0, swpNoMove|swpNoSize|swpNoActivate)
 		}
 	}
 }
 
-// recordPosition stores where a window is, for Save to write out.
-func (o *overlay) recordPosition(hwnd uintptr, field **[2]int) {
-	var r rect
-	if hwnd == 0 {
-		return
-	}
-	if ok, _, _ := pGetWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&r))); ok == 0 {
-		return
-	}
-	*field = &[2]int{int(r.left), int(r.top)}
-}
-
-// render redraws every window, after input or anything else that may have
-// changed them.
+// render redraws everything, after input or anything else that may have
+// changed it.
 func (o *overlay) render() {
 	o.draw([4]bool{true, true, true, true})
 }
 
-// renderDue redraws just the windows whose animation has moved on, so a
-// character gif doesn't keep redrawing the tracker and its settings panel.
+// renderDue redraws just what has moved on, so a character gif doesn't keep
+// redrawing the icons and the settings panel.
 func (o *overlay) renderDue() {
 	now := time.Now().Add(2 * time.Millisecond)
 	var which [4]bool
@@ -662,26 +703,105 @@ func (o *overlay) renderDue() {
 
 func (o *overlay) draw(which [4]bool) {
 	now := time.Now()
+	o.followResize()
 	if which[0] {
 		img, next := o.t.Render(now)
-		o.main.push(img)
+		o.setPart(partTracker, img)
 		o.due[0] = next
 	}
-	if which[1] && o.char.hwnd != 0 {
+	if which[1] {
 		img, next := o.t.RenderCharacter(now)
-		o.char.push(img)
+		o.setPart(partChar, img)
 		o.due[1] = next
 	}
-	if which[2] && o.item.hwnd != 0 {
-		o.followResize()
+	if which[2] {
 		img, next := o.t.RenderItem(now)
-		o.item.push(img)
+		o.setPart(partItem, img)
 		o.due[2] = next
 	}
+	o.compose()
 	if o.panel.hwnd != 0 {
 		o.syncPanel(which[3], now)
 	}
 	o.schedule()
+}
+
+// compose redraws the changed area of the tracker window from the parts,
+// first fitting the window to wherever the parts now are.
+func (o *overlay) compose() {
+	var bounds image.Rectangle
+	for i := range o.parts {
+		bounds = bounds.Union(o.partRect(i))
+	}
+	if bounds.Empty() {
+		return
+	}
+	origin := point{int32(bounds.Min.X), int32(bounds.Min.Y)}
+	moved := origin != o.origin || bounds.Size() != o.winSize
+	if moved || o.main.bits == nil {
+		// The bitmap's contents no longer line up with the screen.
+		if !o.main.ensureBitmap(bounds.Size()) {
+			return
+		}
+		o.dirty = bounds
+	}
+	dirty := o.dirty.Intersect(bounds)
+	o.dirty = image.Rectangle{}
+	if dirty.Empty() && !moved {
+		return
+	}
+
+	// Clear the dirty area, then paint each part over it, bottom up.
+	w := o.main.bmpSize.X
+	dst := unsafe.Slice((*byte)(o.main.bits), w*o.main.bmpSize.Y*4)
+	local := dirty.Sub(bounds.Min)
+	for y := local.Min.Y; y < local.Max.Y; y++ {
+		clear(dst[(y*w+local.Min.X)*4 : (y*w+local.Max.X)*4])
+	}
+	for i, img := range o.parts {
+		r := o.partRect(i).Intersect(dirty)
+		if img == nil || r.Empty() {
+			continue
+		}
+		blendBGRA(dst, w, r.Sub(bounds.Min), img, r.Min.Sub(o.partRect(i).Min))
+	}
+
+	// Set origin first: moving the window sends wmMove, and followMain must
+	// see that it is already where it should be.
+	o.origin, o.winSize = origin, bounds.Size()
+	s := size{int32(bounds.Dx()), int32(bounds.Dy())}
+	dr := rect{int32(local.Min.X), int32(local.Min.Y), int32(local.Max.X), int32(local.Max.Y)}
+	var src point
+	blend := blendFunction{alphaFormat: acSrcAlpha, constantAlpha: 255}
+	info := updateLayeredWindowInfo{
+		pptDst: &origin, psize: &s, src: o.main.memDC, pptSrc: &src,
+		pblend: &blend, flags: ulwAlpha, prcDirty: &dr,
+	}
+	info.size = uint32(unsafe.Sizeof(info))
+	pUpdateLayeredWindowIndirect.Call(o.main.hwnd, uintptr(unsafe.Pointer(&info)))
+}
+
+// blendBGRA paints the part of src starting at sp over r of a premultiplied
+// BGRA bitmap w pixels wide.
+func blendBGRA(dst []byte, w int, r image.Rectangle, src *image.RGBA, sp image.Point) {
+	for y := 0; y < r.Dy(); y++ {
+		d := dst[((r.Min.Y+y)*w+r.Min.X)*4:]
+		s := src.Pix[src.PixOffset(sp.X, sp.Y+y):]
+		for x := 0; x < r.Dx()*4; x += 4 {
+			a := s[x+3]
+			switch a {
+			case 0:
+			case 255:
+				d[x], d[x+1], d[x+2], d[x+3] = s[x+2], s[x+1], s[x], 255
+			default:
+				k := uint32(255 - a)
+				d[x] = s[x+2] + uint8((uint32(d[x])*k+127)/255)
+				d[x+1] = s[x+1] + uint8((uint32(d[x+1])*k+127)/255)
+				d[x+2] = s[x] + uint8((uint32(d[x+2])*k+127)/255)
+				d[x+3] = a + uint8((uint32(d[x+3])*k+127)/255)
+			}
+		}
+	}
 }
 
 // syncPanel shows, draws or hides the settings panel to match the tracker.
@@ -735,15 +855,8 @@ func (o *overlay) followResize() {
 		r := float64(ch) / float64(o.charH)
 		o.itemOff[0] *= r
 		o.itemOff[1] *= r
-		var i rect
-		if o.itemPlaced {
-			if ok, _, _ := pGetWindowRect.Call(o.item.hwnd, uintptr(unsafe.Pointer(&i))); ok != 0 {
-				x := i.left - int32(math.Round(o.itemOff[0]))
-				y := i.top - int32(math.Round(o.itemOff[1]))
-				// The character's wmMove puts the item back at its offset.
-				pSetWindowPos.Call(o.char.hwnd, 0, uintptr(x), uintptr(y), 0, 0, swpNoSize|swpNoZOrder|swpNoActivate)
-			}
-		}
+		i := o.at[partItem]
+		o.moveChar(point{i.x - int32(math.Round(o.itemOff[0])), i.y - int32(math.Round(o.itemOff[1]))})
 	case o.itemPx > 0 && ip != o.itemPx:
 		d := float64(o.itemPx-ip) / 2
 		o.itemOff[0] += d
@@ -754,8 +867,8 @@ func (o *overlay) followResize() {
 }
 
 // push copies img into the window's bitmap and shows it. The window keeps its
-// top-left corner and takes img's size. Pushing the image already shown, such
-// as an animation frame that hasn't changed, does nothing.
+// top-left corner and takes img's size. Pushing the image already shown does
+// nothing.
 func (w *layered) push(img *image.RGBA) {
 	sz := img.Rect.Size()
 	if img == w.shown || sz.X <= 0 || sz.Y <= 0 || !w.ensureBitmap(sz) {
