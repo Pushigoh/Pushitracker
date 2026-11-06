@@ -30,7 +30,6 @@ const (
 	btnH        = 28
 	fadeTime    = 300 * time.Millisecond
 	caretBlink  = 530 * time.Millisecond
-	savedFlash  = 1500 * time.Millisecond
 	minAlphaHit = 1 // nearly invisible, but keeps icon gaps clickable
 )
 
@@ -157,7 +156,8 @@ type Tracker struct {
 	scale    float64
 	iconPx   int // icon size in pixels the icon images were built for
 	icons    []*iconState
-	rowStart []int // index into icons where each row starts
+	iconKeys []string // each icon's name in the settings file: "<row>/<icon>"
+	rowStart []int    // index into icons where each row starts
 
 	started   time.Time // when the tracker opened; the game's idle image plays from here
 	itemPath  string
@@ -167,9 +167,8 @@ type Tracker struct {
 	resetAt   time.Time
 
 	panelOpen bool
-	savedAt   time.Time // when Save was last pressed, to show "Saved"
-	pressed   int       // icon index held down, -1 if none
-	hits      [2][]hit  // per Surface, from the last render
+	pressed   int      // icon index held down, -1 if none
+	hits      [2][]hit // per Surface, from the last render
 	face      font.Face
 	faceScale float64
 
@@ -211,6 +210,7 @@ func NewTracker(sel *Selection) *Tracker {
 		t.rowStart = append(t.rowStart, len(t.icons))
 		for _, def := range r.Icons {
 			t.icons = append(t.icons, &iconState{def: def, stage: -1})
+			t.iconKeys = append(t.iconKeys, r.Name+"/"+def.Key)
 		}
 	}
 	t.rowStart = append(t.rowStart, len(t.icons))
@@ -274,10 +274,12 @@ func (t *Tracker) closePanel() {
 }
 
 // ResetLayout puts the icon, character and item sizes back to their
-// defaults. The window then moves the character and item back to
-// CharacterOffset and ItemOffset. Like any change, it is kept on Save.
+// defaults and the icons back in their rows. The window then moves the
+// character and item back to CharacterOffset and ItemOffset. Like any
+// change, it is kept on Save.
 func (t *Tracker) ResetLayout() {
 	t.gs.IconSize, t.gs.CharSize, t.gs.ItemSize = DefaultIconSize, DefaultCharSize, DefaultItemSize
+	t.gs.IconPos = nil
 	t.itemExact = DefaultItemSize
 	t.prepare()
 }
@@ -327,8 +329,12 @@ func (t *Tracker) setControl(i, n int) bool {
 	return changed
 }
 
+// trackerLayout is where everything in the tracker is. The bar and the icons'
+// rows fill (0,0)-size; icons that have been dragged out of their place can
+// be anywhere, even left of or above that, and bounds covers them too.
 type trackerLayout struct {
 	size       image.Point
+	bounds     image.Rectangle
 	grip, gear image.Rectangle
 	icons      []image.Rectangle
 	iconsEnd   int // y just below the last icon row
@@ -348,7 +354,7 @@ func (t *Tracker) layout() trackerLayout {
 		}
 		x := m
 		for i := from; i < to; i++ {
-			l.icons[i] = image.Rect(x, y, x+icon, y+icon)
+			l.icons[i] = image.Rect(x, y, x+icon, y+icon).Add(t.iconShift(i))
 			x += icon + gap
 		}
 		contentW = max(contentW, x-gap-m)
@@ -362,7 +368,50 @@ func (t *Tracker) layout() trackerLayout {
 	l.gear = image.Rect(l.size.X-m-b, top, l.size.X-m, top+b)
 	l.grip = l.gear.Sub(image.Pt(b+t.px(4), 0))
 
+	l.bounds = image.Rectangle{Max: l.size}
+	for _, r := range l.icons {
+		l.bounds = l.bounds.Union(r)
+	}
 	return l
+}
+
+// iconShift is how far icon i has been dragged from its place in its row, in
+// pixels. It is kept in icon sizes, so the icons keep their arrangement when
+// they are resized.
+func (t *Tracker) iconShift(i int) image.Point {
+	off, ok := t.gs.IconPos[t.iconKeys[i]]
+	if !ok {
+		return image.Point{}
+	}
+	return image.Pt(int(math.Round(off[0]*float64(t.iconPx))), int(math.Round(off[1]*float64(t.iconPx))))
+}
+
+// IconAt returns the icon at p (in the tracker's coordinates), or -1.
+func (t *Tracker) IconAt(p image.Point) int {
+	if h := t.hitAt(SurfMain, p); h.kind == hitIcon {
+		return h.idx
+	}
+	return -1
+}
+
+// IconOffset is how far icon i has been dragged from its place in its row,
+// in icon sizes.
+func (t *Tracker) IconOffset(i int) [2]float64 { return t.gs.IconPos[t.iconKeys[i]] }
+
+// MoveIcon puts icon i at offset (in icon sizes) from its place in its row,
+// moved by d pixels. Like any change, it is kept on Save.
+func (t *Tracker) MoveIcon(i int, from [2]float64, d image.Point) {
+	k := float64(max(t.iconPx, 1))
+	round := func(v float64) float64 { return math.Round(v*1000) / 1000 }
+	off := [2]float64{round(from[0] + float64(d.X)/k), round(from[1] + float64(d.Y)/k)}
+	if t.gs.IconPos == nil {
+		t.gs.IconPos = map[string][2]float64{}
+	}
+	if off == [2]float64{} {
+		delete(t.gs.IconPos, t.iconKeys[i])
+	} else {
+		t.gs.IconPos[t.iconKeys[i]] = off
+	}
 }
 
 func (t *Tracker) Size() image.Point { return t.layout().size }
@@ -416,11 +465,12 @@ func (t *Tracker) tick(now time.Time) {
 }
 
 // Render draws the tracker (the icons and its buttons) and returns when it
-// next needs redrawing (zero if it is static until the next input).
+// next needs redrawing (zero if it is static until the next input). The
+// image's bounds are layout().bounds, so they can start left of or above 0,0.
 func (t *Tracker) Render(now time.Time) (*image.RGBA, time.Time) {
 	t.tick(now)
 	l := t.layout()
-	img := image.NewRGBA(image.Rectangle{Max: l.size})
+	img := image.NewRGBA(l.bounds)
 	t.hits[SurfMain] = t.hits[SurfMain][:0]
 	var next time.Time
 	wake := func(at time.Time) {
@@ -543,13 +593,8 @@ func (t *Tracker) renderPanel(img *image.RGBA, panel image.Rectangle, now time.T
 	half := (inner.Dx() - t.px(6)) / 2
 	save := image.Rect(inner.Min.X, y, inner.Min.X+half, y+t.px(btnH))
 	reset := image.Rect(inner.Max.X-half, y, inner.Max.X, y+t.px(btnH))
-	label := "Save"
-	if until := t.savedAt.Add(savedFlash); now.Before(until) {
-		label = "Saved"
-		wake(until)
-	}
 	fillRoundRect(img, save, float64(t.px(5)), colAccent)
-	drawTextCentered(img, t.face, label, save, colOnColor)
+	drawTextCentered(img, t.face, "Save", save, colOnColor)
 	fillRoundRect(img, reset, float64(t.px(5)), colButton)
 	drawTextCentered(img, t.face, "Reset layout", reset, colFg)
 	t.hits[SurfPanel] = append(t.hits[SurfPanel], hit{r: save, kind: hitSave}, hit{r: reset, kind: hitReset})
@@ -688,10 +733,7 @@ func (t *Tracker) MouseDown(s Surface, p image.Point, now time.Time) Action {
 		t.gs.AlwaysOnTop = !t.gs.AlwaysOnTop
 		return ActTopmost
 	case hitSave:
-		if t.editIdx >= 0 {
-			t.commitEdit()
-		}
-		t.savedAt = now
+		t.closePanel()
 		return ActSave
 	case hitReset:
 		t.editIdx = -1

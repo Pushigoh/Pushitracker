@@ -48,6 +48,9 @@ type GameSettings struct {
 	CharPos     *[2]int `json:"characterPos,omitempty"`
 	ItemPos     *[2]int `json:"itemPos,omitempty"`
 	PanelPos    *[2]int `json:"settingsPanelPos,omitempty"`
+	// Icons dragged out of their place in their row: how far, in icon
+	// sizes, by "<row>/<icon>".
+	IconPos map[string][2]float64 `json:"iconPositions,omitempty"`
 
 	path string
 }
