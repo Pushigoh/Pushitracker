@@ -17,8 +17,8 @@ import (
 // shows through wherever it is transparent, and clicks there pass through to
 // what's behind. The icons, the character and the item display above its
 // head are all drawn in this one window, so capturing it (in OBS, say) shows
-// all of them. Each can still be dragged on its own: the window grows to
-// cover wherever they are. The item follows the character when the character
+// all of them. Each can still be dragged on its own, and so can each icon
+// with Ctrl held: the window grows to cover wherever they are. The item follows the character when the character
 // moves or is resized; everything follows the grip. The settings panel has a
 // window of its own, owned by the tracker window.
 
@@ -38,6 +38,7 @@ var (
 	pSendMessageW                 = user32.NewProc("SendMessageW")
 	pPostQuitMessage              = user32.NewProc("PostQuitMessage")
 	pSetCapture                   = user32.NewProc("SetCapture")
+	pGetKeyState                  = user32.NewProc("GetKeyState")
 	pSetFocus                     = user32.NewProc("SetFocus")
 	pSetForegroundWindow          = user32.NewProc("SetForegroundWindow")
 	pReleaseCapture               = user32.NewProc("ReleaseCapture")
@@ -88,6 +89,8 @@ const (
 	wmExitSizeMove = 0x0232
 	wmDpiChanged   = 0x02E0
 	wmTimer        = 0x0113
+	mkControl      = 0x0008
+	vkControl      = 0x11
 	htCaption      = 2
 	htClient       = 1
 	idcArrow       = 32512
@@ -211,10 +214,14 @@ type overlay struct {
 	itemPx  int
 
 	// The character or item being dragged (-1 for none), where the cursor
-	// was when the drag started and where the part was.
-	dragPart  int
-	dragFrom  point
-	dragStart point
+	// was when the drag started and where the part was. partTracker means an
+	// icon is being dragged: dragIcon, which started dragIconFrom away from
+	// its place in its row.
+	dragPart     int
+	dragFrom     point
+	dragStart    point
+	dragIcon     int
+	dragIconFrom [2]float64
 
 	// Where the settings panel sits relative to the tracker, once it has been
 	// opened or loaded from the settings file.
@@ -372,25 +379,37 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 		pPostQuitMessage.Call(0)
 	case wmLButtonDown:
 		p := o.partAt(lParamPoint(lParam))
-		if p != partChar && p != partItem {
+		switch {
+		case p == partChar || p == partItem:
+			// Dragging the character brings the item along; dragging the
+			// item moves just the item.
+			o.dragPart, o.dragFrom, o.dragStart = p, cursorPos(), o.at[p]
+		case p == partTracker && wParam&mkControl != 0 && o.iconAt(lParamPoint(lParam)) >= 0:
+			// Ctrl+drag moves one icon.
+			i := o.iconAt(lParamPoint(lParam))
+			o.dragPart, o.dragFrom, o.dragIcon, o.dragIconFrom = partTracker, cursorPos(), i, o.t.IconOffset(i)
+		default:
 			return o.inputProc(SurfMain, hwnd, message, wParam, lParam)
 		}
-		// Dragging the character brings the item along; dragging the item
-		// moves just the item.
-		o.dragPart, o.dragFrom, o.dragStart = p, cursorPos(), o.at[p]
 		pSetCapture.Call(hwnd)
 	case wmMouseMove:
 		if o.dragPart < 0 {
 			return o.inputProc(SurfMain, hwnd, message, wParam, lParam)
 		}
 		c := cursorPos()
-		to := point{o.dragStart.x + c.x - o.dragFrom.x, o.dragStart.y + c.y - o.dragFrom.y}
-		if o.dragPart == partChar {
+		d := point{c.x - o.dragFrom.x, c.y - o.dragFrom.y}
+		to := point{o.dragStart.x + d.x, o.dragStart.y + d.y}
+		switch o.dragPart {
+		case partTracker:
+			o.t.MoveIcon(o.dragIcon, o.dragIconFrom, image.Pt(int(d.x), int(d.y)))
+			o.draw([4]bool{true})
+		case partChar:
 			o.moveChar(to)
-		} else {
+			o.compose()
+		default:
 			o.movePart(partItem, to)
+			o.compose()
 		}
-		o.compose()
 	case wmLButtonUp, wmCaptureChg:
 		if o.dragPart < 0 {
 			return o.inputProc(SurfMain, hwnd, message, wParam, lParam)
@@ -406,7 +425,8 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 		if lParam&0xffff != htClient {
 			return 0, false
 		}
-		if p := o.partAt(clientPoint(hwnd, cursorPos())); p == partChar || p == partItem {
+		c := clientPoint(hwnd, cursorPos())
+		if p := o.partAt(c); p == partChar || p == partItem || p == partTracker && ctrlDown() && o.iconAt(c) >= 0 {
 			setCursor(idcSizeAll)
 			return 1, true
 		}
@@ -438,7 +458,7 @@ func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (u
 	// coordinates.
 	var off image.Point
 	if s == SurfMain {
-		off = image.Pt(int(o.at[partTracker].x-o.origin.x), int(o.at[partTracker].y-o.origin.y))
+		off = o.trackerOff()
 	}
 	switch message {
 	case wmLButtonDown:
@@ -527,6 +547,19 @@ func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (u
 	return 0, true
 }
 
+// trackerOff is where the tracker's own 0,0 is in the tracker window.
+func (o *overlay) trackerOff() image.Point {
+	return image.Pt(int(o.at[partTracker].x-o.origin.x), int(o.at[partTracker].y-o.origin.y))
+}
+
+// iconAt returns the icon at p, in tracker window coordinates, or -1.
+func (o *overlay) iconAt(p image.Point) int { return o.t.IconAt(p.Sub(o.trackerOff())) }
+
+func ctrlDown() bool {
+	s, _, _ := pGetKeyState.Call(vkControl)
+	return int16(s) < 0
+}
+
 // partAt returns the topmost part with a visible pixel at p, in tracker
 // window coordinates, or -1 if there is none.
 func (o *overlay) partAt(p image.Point) int {
@@ -544,13 +577,14 @@ func (o *overlay) partAt(p image.Point) int {
 	return -1
 }
 
-// partRect is where part i is on screen.
+// partRect is where part i is on screen. at is where the part's 0,0 is; its
+// picture can start left of or above that (the tracker's can, when icons have
+// been dragged there).
 func (o *overlay) partRect(i int) image.Rectangle {
 	if o.parts[i] == nil {
 		return image.Rectangle{}
 	}
-	tl := image.Pt(int(o.at[i].x), int(o.at[i].y))
-	return image.Rectangle{Min: tl, Max: tl.Add(o.parts[i].Rect.Size())}
+	return o.parts[i].Rect.Add(image.Pt(int(o.at[i].x), int(o.at[i].y)))
 }
 
 // setPart gives part i a new picture.
@@ -763,7 +797,7 @@ func (o *overlay) compose() {
 		if img == nil || r.Empty() {
 			continue
 		}
-		blendBGRA(dst, w, r.Sub(bounds.Min), img, r.Min.Sub(o.partRect(i).Min))
+		blendBGRA(dst, w, r.Sub(bounds.Min), img, r.Min.Sub(image.Pt(int(o.at[i].x), int(o.at[i].y))))
 	}
 
 	// Set origin first: moving the window sends wmMove, and followMain must
@@ -781,7 +815,7 @@ func (o *overlay) compose() {
 	pUpdateLayeredWindowIndirect.Call(o.main.hwnd, uintptr(unsafe.Pointer(&info)))
 }
 
-// blendBGRA paints the part of src starting at sp over r of a premultiplied
+// blendBGRA paints the part of src starting at sp (in src's coordinates) over r of a premultiplied
 // BGRA bitmap w pixels wide.
 func blendBGRA(dst []byte, w int, r image.Rectangle, src *image.RGBA, sp image.Point) {
 	for y := 0; y < r.Dy(); y++ {
