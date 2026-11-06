@@ -7,37 +7,81 @@ import (
 	_ "image/jpeg"
 	_ "image/png"
 	"os"
-	"sync"
 	"time"
 
 	xdraw "golang.org/x/image/draw"
 )
 
-// Anim is a decoded image. Still images have a single frame.
-type Anim struct {
-	Frames []*image.RGBA
-	Delays []time.Duration
-	Total  time.Duration
-	Loops  int // number of extra plays; -1 means forever
+// animSource is a loaded file. A gif is kept in its compact paletted form and
+// turned into full-colour frames only as they are shown, since decoded frames
+// take many times the memory the gif does.
+type animSource struct {
+	gif    *gif.GIF    // nil for a still image
+	still  *image.RGBA // set for a still image
+	bounds image.Rectangle
+	delays []time.Duration
+	total  time.Duration
+	loops  int // number of extra plays; -1 means forever
 }
 
-// Frame returns the frame to show after elapsed time, and how long until the
-// next frame change (0 when the image no longer changes).
-func (a *Anim) Frame(elapsed time.Duration) (*image.RGBA, time.Duration) {
-	i, d := a.frameIndex(elapsed)
-	return a.Frames[i], d
+func loadSource(path string) *animSource {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	if g, err := gif.DecodeAll(f); err == nil && len(g.Image) > 0 {
+		return gifSource(g)
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return nil
+	}
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return nil
+	}
+	s := toRGBA(img)
+	return &animSource{still: s, bounds: s.Rect, delays: []time.Duration{0}}
 }
 
-func (a *Anim) frameIndex(elapsed time.Duration) (int, time.Duration) {
-	last := len(a.Frames) - 1
-	if last == 0 || a.Total <= 0 {
+func gifSource(g *gif.GIF) *animSource {
+	s := &animSource{gif: g, bounds: image.Rect(0, 0, g.Config.Width, g.Config.Height)}
+	if s.bounds.Empty() {
+		s.bounds = g.Image[0].Bounds()
+	}
+	switch {
+	case g.LoopCount == 0:
+		s.loops = -1
+	case g.LoopCount < 0:
+		s.loops = 0
+	default:
+		s.loops = g.LoopCount
+	}
+	for i := range g.Image {
+		// Browsers bump very short delays up to 100ms.
+		d := time.Duration(g.Delay[i]) * 10 * time.Millisecond
+		if d <= 10*time.Millisecond {
+			d = 100 * time.Millisecond
+		}
+		s.delays = append(s.delays, d)
+		s.total += d
+	}
+	return s
+}
+
+// frameIndex returns the frame to show after elapsed time, and how long until
+// the next frame change (0 when the image no longer changes).
+func (s *animSource) frameIndex(elapsed time.Duration) (int, time.Duration) {
+	last := len(s.delays) - 1
+	if last == 0 || s.total <= 0 {
 		return 0, 0
 	}
-	if a.Loops >= 0 && elapsed >= a.Total*time.Duration(a.Loops+1) {
+	if s.loops >= 0 && elapsed >= s.total*time.Duration(s.loops+1) {
 		return last, 0
 	}
-	t := elapsed % a.Total
-	for i, d := range a.Delays {
+	t := elapsed % s.total
+	for i, d := range s.delays {
 		if t < d {
 			return i, d - t
 		}
@@ -46,94 +90,93 @@ func (a *Anim) frameIndex(elapsed time.Duration) (int, time.Duration) {
 	return last, 0
 }
 
-// Scaled returns a copy stretched to w×h, ignoring the aspect ratio.
-func (a *Anim) Scaled(w, h int) *Anim { return a.ScaledWith(xdraw.CatmullRom, w, h) }
+// SizedAnim is a file stretched to one size. Gif frames are composited and
+// scaled the first time they are shown, so showing a gif or changing its size
+// costs a frame at a time rather than the whole animation up front.
+type SizedAnim struct {
+	path   string
+	src    *animSource
+	w, h   int
+	frames []*image.RGBA
 
-func (a *Anim) ScaledWith(k xdraw.Interpolator, w, h int) *Anim {
-	if b := a.Frames[0].Bounds(); b.Dx() == w && b.Dy() == h {
-		return a
-	}
-	out := *a
-	out.Frames = make([]*image.RGBA, len(a.Frames))
-	for i, f := range a.Frames {
-		dst := image.NewRGBA(image.Rect(0, 0, w, h))
-		k.Scale(dst, dst.Bounds(), f, f.Bounds(), xdraw.Src, nil)
-		out.Frames[i] = dst
-	}
-	return &out
+	// Gif playback state: canvas holds frames up to next composited at the
+	// gif's own size, the way browsers play them. It is dropped once every
+	// frame has been built.
+	canvas *image.RGBA
+	next   int
 }
 
-func LoadAnim(path string) (*Anim, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
+func newSized(path string, src *animSource, w, h int) *SizedAnim {
+	s := &SizedAnim{path: path, src: src, w: w, h: h}
+	if src != nil {
+		s.frames = make([]*image.RGBA, len(src.delays))
 	}
-	defer f.Close()
+	return s
+}
 
-	if g, err := gif.DecodeAll(f); err == nil && len(g.Image) > 0 {
-		return gifAnim(g), nil
+// Frame returns the frame to show after elapsed time, and how long until the
+// next frame change (0 when the image no longer changes).
+func (s *SizedAnim) Frame(elapsed time.Duration) (*image.RGBA, time.Duration) {
+	i, d := s.src.frameIndex(elapsed)
+	if s.frames[i] == nil {
+		if s.src.gif == nil {
+			s.frames[i] = scaleTo(s.src.still, s.w, s.h, xdraw.BiLinear)
+		} else {
+			for s.next <= i {
+				s.composite()
+			}
+		}
 	}
-	if _, err := f.Seek(0, 0); err != nil {
-		return nil, err
+	return s.frames[i], d
+}
+
+// composite draws the next gif frame onto the canvas, honouring each frame's
+// disposal method, and keeps a scaled copy of the result.
+func (s *SizedAnim) composite() {
+	g := s.src.gif
+	if s.canvas == nil {
+		s.canvas = image.NewRGBA(s.src.bounds)
 	}
-	img, _, err := image.Decode(f)
-	if err != nil {
-		return nil, err
+	i, frame := s.next, g.Image[s.next]
+	disposal := byte(gif.DisposalNone)
+	if i < len(g.Disposal) {
+		disposal = g.Disposal[i]
 	}
+	var restore *image.RGBA
+	if disposal == gif.DisposalPrevious {
+		restore = image.NewRGBA(s.canvas.Rect)
+		copy(restore.Pix, s.canvas.Pix)
+	}
+	draw.Draw(s.canvas, frame.Bounds(), frame, frame.Bounds().Min, draw.Over)
+	s.frames[i] = scaleTo(s.canvas, s.w, s.h, xdraw.BiLinear)
+
+	switch disposal {
+	case gif.DisposalBackground:
+		draw.Draw(s.canvas, frame.Bounds(), image.Transparent, image.Point{}, draw.Src)
+	case gif.DisposalPrevious:
+		s.canvas = restore
+	}
+	s.next++
+	if s.next == len(g.Image) {
+		s.canvas = nil
+	}
+}
+
+// scaleTo returns a copy of img stretched to w×h, ignoring the aspect ratio.
+func scaleTo(img *image.RGBA, w, h int, k xdraw.Interpolator) *image.RGBA {
+	dst := image.NewRGBA(image.Rect(0, 0, w, h))
+	if img.Rect.Dx() == w && img.Rect.Dy() == h {
+		copy(dst.Pix, img.Pix)
+		return dst
+	}
+	k.Scale(dst, dst.Bounds(), img, img.Rect, xdraw.Src, nil)
+	return dst
+}
+
+func toRGBA(img image.Image) *image.RGBA {
 	rgba := image.NewRGBA(image.Rect(0, 0, img.Bounds().Dx(), img.Bounds().Dy()))
 	draw.Draw(rgba, rgba.Bounds(), img, img.Bounds().Min, draw.Src)
-	return &Anim{Frames: []*image.RGBA{rgba}, Delays: []time.Duration{0}}, nil
-}
-
-// gifAnim composites GIF frames onto a full canvas, honouring each frame's
-// disposal method, the same way browsers play them.
-func gifAnim(g *gif.GIF) *Anim {
-	bounds := image.Rect(0, 0, g.Config.Width, g.Config.Height)
-	if bounds.Empty() {
-		bounds = g.Image[0].Bounds()
-	}
-	canvas := image.NewRGBA(bounds)
-	a := &Anim{}
-	switch {
-	case g.LoopCount == 0:
-		a.Loops = -1
-	case g.LoopCount < 0:
-		a.Loops = 0
-	default:
-		a.Loops = g.LoopCount
-	}
-	for i, frame := range g.Image {
-		var restore *image.RGBA
-		disposal := byte(gif.DisposalNone)
-		if i < len(g.Disposal) {
-			disposal = g.Disposal[i]
-		}
-		if disposal == gif.DisposalPrevious {
-			restore = image.NewRGBA(bounds)
-			copy(restore.Pix, canvas.Pix)
-		}
-		draw.Draw(canvas, frame.Bounds(), frame, frame.Bounds().Min, draw.Over)
-
-		snap := image.NewRGBA(bounds)
-		copy(snap.Pix, canvas.Pix)
-		a.Frames = append(a.Frames, snap)
-
-		// Browsers bump very short delays up to 100ms.
-		d := time.Duration(g.Delay[i]) * 10 * time.Millisecond
-		if d <= 10*time.Millisecond {
-			d = 100 * time.Millisecond
-		}
-		a.Delays = append(a.Delays, d)
-		a.Total += d
-
-		switch disposal {
-		case gif.DisposalBackground:
-			draw.Draw(canvas, frame.Bounds(), image.Transparent, image.Point{}, draw.Src)
-		case gif.DisposalPrevious:
-			canvas = restore
-		}
-	}
-	return a
+	return rgba
 }
 
 // grayscale converts to grey using Rec. 709 luminance. It works directly on
@@ -148,95 +191,73 @@ func grayscale(img *image.RGBA) *image.RGBA {
 	return out
 }
 
-// AnimCache loads each file once, and keeps one scaled copy of each file at
-// the size it was last drawn at. Missing or broken files are cached as nil.
-type AnimCache struct {
-	mu      sync.Mutex
-	entries map[string]*cacheEntry
-	sized   map[string]*SizedAnim
-}
+// keepShown is how many recently shown files AnimCache keeps: enough for the
+// character and item, each with its idle image and the one clicked last.
+const keepShown = 4
 
-type cacheEntry struct {
-	once sync.Once
-	anim *Anim
+// AnimCache keeps the icon images, and the few files shown most recently.
+// Anything else is loaded again from disk when it is next shown. Missing or
+// broken files are cached as nil, so they aren't retried every frame.
+type AnimCache struct {
+	icons map[string]*image.RGBA
+	shown []*SizedAnim // most recently used first
 }
 
 func NewAnimCache() *AnimCache {
-	return &AnimCache{entries: map[string]*cacheEntry{}, sized: map[string]*SizedAnim{}}
+	return &AnimCache{icons: map[string]*image.RGBA{}}
 }
 
-// Native returns the file at path at its own size, or nil if it can't be
-// loaded.
-func (c *AnimCache) Native(path string) *Anim {
-	if path == "" {
-		return nil
-	}
-	c.mu.Lock()
-	e, ok := c.entries[path]
+// Icon returns the first frame of the image at path at its own size, or nil
+// if it can't be loaded.
+func (c *AnimCache) Icon(path string) *image.RGBA {
+	img, ok := c.icons[path]
 	if !ok {
-		e = &cacheEntry{}
-		c.entries[path] = e
-	}
-	c.mu.Unlock()
-	e.once.Do(func() {
-		if a, err := LoadAnim(path); err == nil {
-			e.anim = a
+		if f, err := os.Open(path); err == nil {
+			if d, _, err := image.Decode(f); err == nil {
+				img = toRGBA(d)
+			}
+			f.Close()
 		}
-	})
-	return e.anim
+		c.icons[path] = img
+	}
+	return img
 }
 
 // Sized returns the file at path stretched to w×h, or nil if it can't be
-// loaded. Only the latest size per file is kept, since sizes change
-// continuously while a size slider is dragged.
+// loaded.
 func (c *AnimCache) Sized(path string, w, h int) *SizedAnim {
-	native := c.Native(path)
-	if native == nil {
+	if path == "" {
 		return nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	s := c.sized[path]
-	if s == nil || s.w != w || s.h != h {
-		s = &SizedAnim{native: native, w: w, h: h, frames: make([]*image.RGBA, len(native.Frames))}
-		if b := native.Frames[0].Bounds(); b.Dx() == w && b.Dy() == h {
-			copy(s.frames, native.Frames)
+	var s *SizedAnim
+	at := -1
+	for i, e := range c.shown {
+		if e.path == path {
+			s, at = e, i
+			break
 		}
-		c.sized[path] = s
+	}
+	switch {
+	case s == nil:
+		s = newSized(path, loadSource(path), w, h)
+	case s.w != w || s.h != h:
+		// Only the latest size is kept, since sizes change continuously
+		// while a size slider is dragged.
+		s = newSized(path, s.src, w, h)
+	}
+	// Move it to the front, dropping the least recently shown if full.
+	if at < 0 {
+		c.shown = append(c.shown, nil)
+		at = len(c.shown) - 1
+	}
+	copy(c.shown[1:at+1], c.shown[:at])
+	c.shown[0] = s
+	if len(c.shown) > keepShown {
+		c.shown[keepShown] = nil
+		c.shown = c.shown[:keepShown]
+	}
+	if s.src == nil {
+		return nil
 	}
 	return s
-}
-
-// SizedAnim is an Anim stretched to one size. Frames are scaled the first
-// time they are shown, so a new size costs one frame rather than the whole
-// animation, which keeps size sliders responsive.
-type SizedAnim struct {
-	mu     sync.Mutex
-	native *Anim
-	w, h   int
-	frames []*image.RGBA
-}
-
-func (s *SizedAnim) Frame(elapsed time.Duration) (*image.RGBA, time.Duration) {
-	i, d := s.native.frameIndex(elapsed)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.frames[i] == nil {
-		src := s.native.Frames[i]
-		dst := image.NewRGBA(image.Rect(0, 0, s.w, s.h))
-		xdraw.BiLinear.Scale(dst, dst.Bounds(), src, src.Bounds(), xdraw.Src, nil)
-		s.frames[i] = dst
-	}
-	return s.frames[i], d
-}
-
-// Preload decodes files in the background so the first click doesn't stall.
-func (c *AnimCache) Preload(paths []string) {
-	go func() {
-		for _, p := range paths {
-			if fileExists(p) {
-				c.Native(p)
-			}
-		}
-	}()
 }

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"time"
 
+	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/font"
 )
 
@@ -158,6 +159,7 @@ type Tracker struct {
 	icons    []*iconState
 	rowStart []int // index into icons where each row starts
 
+	started   time.Time // when the tracker opened; the game's idle image plays from here
 	itemPath  string
 	itemStart time.Time
 	charPath  string
@@ -242,7 +244,8 @@ func NewTracker(sel *Selection) *Tracker {
 	t.itemExact = float64(t.gs.ItemSize)
 	t.tracks = make([]image.Rectangle, len(t.controls))
 
-	t.charPath, t.charStart = filepath.Join(t.charDir, idleGif), time.Now()
+	t.started = time.Now()
+	t.charPath, t.charStart = filepath.Join(t.charDir, idleGif), t.started
 	return t
 }
 
@@ -286,7 +289,6 @@ func (t *Tracker) SetScale(s float64) {
 	}
 	t.scale = s
 	t.prepare()
-	t.preload()
 }
 
 // prepare (re)builds everything that depends on pixel sizes.
@@ -299,8 +301,8 @@ func (t *Tracker) prepare() {
 				var c *image.RGBA
 				// Scaled straight from the full-size image: the slider passes
 				// through many sizes and caching each one would pile up memory.
-				if a := t.cache.Native(st.Path); a != nil {
-					c = a.Scaled(size, size).Frames[0]
+				if img := t.cache.Icon(st.Path); img != nil {
+					c = scaleTo(img, size, size, xdraw.CatmullRom)
 				} else {
 					c = image.NewRGBA(image.Rect(0, 0, size, size))
 				}
@@ -312,18 +314,6 @@ func (t *Tracker) prepare() {
 	if t.faceScale != t.scale {
 		t.face, t.faceScale = newFace(13*t.scale), t.scale
 	}
-}
-
-func (t *Tracker) preload() {
-	var items, chars []string
-	for _, s := range t.icons {
-		for _, st := range s.def.Stages {
-			items = append(items, t.gifFile(st.ID))
-			chars = append(chars, t.charFile(st.ID))
-		}
-	}
-	chars = append(chars, filepath.Join(t.charDir, rewardGif))
-	t.cache.Preload(append(items, chars...))
 }
 
 // setControl applies a value to control i; it reports whether it changed.
@@ -492,55 +482,38 @@ func (t *Tracker) RenderPanel(now time.Time) (*image.RGBA, time.Time) {
 
 // RenderItem draws the item display (the clicked item's gif, or the game's
 // idle image) for its own window.
+// The returned image may be a cached frame, so it must not be changed.
 func (t *Tracker) RenderItem(now time.Time) (*image.RGBA, time.Time) {
 	t.tick(now)
-	size := t.ItemSize()
-	img := image.NewRGBA(image.Rectangle{Max: size})
 	// No fill: transparent parts click through to whatever is behind, such
 	// as the icons.
-	var next time.Time
-	path, start := t.game.IdlePath, time.Time{}
+	path, start, until := t.game.IdlePath, t.started, time.Time{}
 	if !t.resetAt.IsZero() {
-		path, start, next = t.itemPath, t.itemStart, t.resetAt
+		path, start, until = t.itemPath, t.itemStart, t.resetAt
 	}
-	if a := t.cache.Sized(path, size.X, size.Y); a != nil {
-		drawAnimFrame(img, image.Point{}, a, start, now, func(at time.Time) {
-			if next.IsZero() || at.Before(next) {
-				next = at
-			}
-		})
-	}
-	return img, next
+	return t.animFrame(path, t.ItemSize(), start, until, now)
 }
 
 // RenderCharacter draws the character on its own, for its separate window.
+// The returned image may be a cached frame, so it must not be changed.
 func (t *Tracker) RenderCharacter(now time.Time) (*image.RGBA, time.Time) {
 	t.tick(now)
-	size := t.CharacterSize()
-	img := image.NewRGBA(image.Rectangle{Max: size})
-	var next time.Time
-	if !t.resetAt.IsZero() {
-		next = t.resetAt
-	}
-	if a := t.cache.Sized(t.charPath, size.X, size.Y); a != nil {
-		drawAnimFrame(img, image.Point{}, a, t.charStart, now, func(at time.Time) {
-			if next.IsZero() || at.Before(next) {
-				next = at
-			}
-		})
-	}
-	return img, next
+	return t.animFrame(t.charPath, t.CharacterSize(), t.charStart, t.resetAt, now)
 }
 
-func drawAnimFrame(img *image.RGBA, at image.Point, a *SizedAnim, start, now time.Time, wake func(time.Time)) {
-	if start.IsZero() {
-		start = now
+// animFrame returns the frame of the file at path that is due at now, played
+// from start, and when to draw again: the next frame change or until,
+// whichever comes first (zero for neither).
+func (t *Tracker) animFrame(path string, size image.Point, start, until, now time.Time) (*image.RGBA, time.Time) {
+	a := t.cache.Sized(path, size.X, size.Y)
+	if a == nil {
+		return image.NewRGBA(image.Rectangle{Max: size}), until
 	}
 	frame, d := a.Frame(now.Sub(start))
-	if d > 0 {
-		wake(now.Add(d))
+	if d > 0 && (until.IsZero() || now.Add(d).Before(until)) {
+		until = now.Add(d)
 	}
-	drawImage(img, at, frame, 1)
+	return frame, until
 }
 
 func (t *Tracker) renderPanel(img *image.RGBA, panel image.Rectangle, now time.Time, wake func(time.Time)) {
