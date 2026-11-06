@@ -218,7 +218,7 @@ func runTracker(t *Tracker) {
 	current = o
 	defer func() { current = nil }()
 
-	title := windows.StringToUTF16Ptr("Pushitracker")
+	title := windows.StringToUTF16Ptr(appName())
 	x, y := screenPosition(t.gs.TrackerPos, func() (int32, int32) {
 		w, _, _ := pGetSystemMetrics.Call(smCxScreen)
 		h, _, _ := pGetSystemMetrics.Call(smCyScreen)

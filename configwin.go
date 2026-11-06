@@ -103,7 +103,7 @@ func runConfigWindow(th *material.Theme, s *Settings) *Selection {
 	c.rescan()
 
 	w := new(app.Window)
-	w.Option(app.Title("Pushitracker – Setup"), app.Size(unit.Dp(600), unit.Dp(560)), app.MinSize(unit.Dp(460), unit.Dp(420)))
+	w.Option(app.Title(appName()+" – Setup"), app.Size(unit.Dp(600), unit.Dp(560)), app.MinSize(unit.Dp(460), unit.Dp(420)))
 
 	var ops op.Ops
 	started := false

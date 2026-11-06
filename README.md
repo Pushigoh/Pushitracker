@@ -1,5 +1,13 @@
 # Pushitracker
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="Pushitracker with icon rows, an item and a character" width="380">
+</p>
+
+## Download
+
+Get the latest version from the [Releases page](https://github.com/Pushigoh/Pushitracker/releases/latest).
+
 ## Build
 
 Needs Go 1.27+.
