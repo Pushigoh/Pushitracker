@@ -47,15 +47,7 @@ func fillShape(dst *image.RGBA, bounds image.Rectangle, c color.NRGBA, inside fu
 	bounds = bounds.Intersect(dst.Rect)
 	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
 		for x := bounds.Min.X; x < bounds.Max.X; x++ {
-			n := 0
-			for sy := 0; sy < 4; sy++ {
-				for sx := 0; sx < 4; sx++ {
-					if inside(float64(x)+(float64(sx)+0.5)/4, float64(y)+(float64(sy)+0.5)/4) {
-						n++
-					}
-				}
-			}
-			blend(dst, x, y, pc, float64(n)/16)
+			blend(dst, x, y, pc, coverage(x, y, inside))
 		}
 	}
 }
@@ -113,10 +105,54 @@ func strokeRoundRect(dst *image.RGBA, r image.Rectangle, radius, width float64, 
 		fillShape(dst, r, c, stroke)
 		return
 	}
-	fillShape(dst, image.Rect(r.Min.X, r.Min.Y, r.Max.X, r.Min.Y+k), c, stroke)
-	fillShape(dst, image.Rect(r.Min.X, r.Max.Y-k, r.Max.X, r.Max.Y), c, stroke)
-	fillShape(dst, image.Rect(r.Min.X, r.Min.Y+k, r.Min.X+k, r.Max.Y-k), c, stroke)
-	fillShape(dst, image.Rect(r.Max.X-k, r.Min.Y+k, r.Max.X, r.Max.Y-k), c, stroke)
+	// The corners are sampled pixel by pixel. Along the straight edges
+	// between them the coverage only changes across the edge, so it is
+	// sampled once per row (top and bottom) or column (sides).
+	for _, cr := range []image.Rectangle{
+		image.Rect(r.Min.X, r.Min.Y, r.Min.X+k, r.Min.Y+k),
+		image.Rect(r.Max.X-k, r.Min.Y, r.Max.X, r.Min.Y+k),
+		image.Rect(r.Min.X, r.Max.Y-k, r.Min.X+k, r.Max.Y),
+		image.Rect(r.Max.X-k, r.Max.Y-k, r.Max.X, r.Max.Y),
+	} {
+		fillShape(dst, cr, c, stroke)
+	}
+	pc := premul(c)
+	midX, midY := (r.Min.X+r.Max.X)/2, (r.Min.Y+r.Max.Y)/2
+	for _, y := range append(span(r.Min.Y, r.Min.Y+k), span(r.Max.Y-k, r.Max.Y)...) {
+		if cov := coverage(midX, y, stroke); cov > 0 {
+			for x := r.Min.X + k; x < r.Max.X-k; x++ {
+				blend(dst, x, y, pc, cov)
+			}
+		}
+	}
+	for _, x := range append(span(r.Min.X, r.Min.X+k), span(r.Max.X-k, r.Max.X)...) {
+		if cov := coverage(x, midY, stroke); cov > 0 {
+			for y := r.Min.Y + k; y < r.Max.Y-k; y++ {
+				blend(dst, x, y, pc, cov)
+			}
+		}
+	}
+}
+
+// coverage is how much of pixel (x, y) is inside, from 4×4 samples.
+func coverage(x, y int, inside func(x, y float64) bool) float64 {
+	n := 0
+	for sy := 0; sy < 4; sy++ {
+		for sx := 0; sx < 4; sx++ {
+			if inside(float64(x)+(float64(sx)+0.5)/4, float64(y)+(float64(sy)+0.5)/4) {
+				n++
+			}
+		}
+	}
+	return float64(n) / 16
+}
+
+func span(from, to int) []int {
+	s := make([]int, 0, max(to-from, 0))
+	for i := from; i < to; i++ {
+		s = append(s, i)
+	}
+	return s
 }
 
 // drawGear draws a cog centred in r.
@@ -206,6 +242,18 @@ func drawText(dst *image.RGBA, face font.Face, s string, x, midY int, c color.NR
 	baseline := midY + (m.Ascent.Ceil()-m.Descent.Ceil())/2
 	d := font.Drawer{Dst: dst, Src: image.NewUniform(c), Face: face, Dot: fixed.P(x, baseline)}
 	d.DrawString(s)
+}
+
+// fitText shortens s with an ellipsis so it fits in w pixels.
+func fitText(face font.Face, s string, w int) string {
+	if font.MeasureString(face, s).Ceil() <= w {
+		return s
+	}
+	r := []rune(s)
+	for len(r) > 0 && font.MeasureString(face, string(r)+"…").Ceil() > w {
+		r = r[:len(r)-1]
+	}
+	return string(r) + "…"
 }
 
 // drawTextCentered draws s centred in r.
