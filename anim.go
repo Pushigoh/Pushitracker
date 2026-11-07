@@ -212,15 +212,25 @@ func NewAnimCache() *AnimCache {
 func (c *AnimCache) Icon(path string) *image.RGBA {
 	img, ok := c.icons[path]
 	if !ok {
-		if f, err := os.Open(path); err == nil {
-			if d, _, err := image.Decode(f); err == nil {
-				img = toRGBA(d)
-			}
-			f.Close()
-		}
+		img = loadStill(path)
 		c.icons[path] = img
 	}
 	return img
+}
+
+// loadStill returns the first frame of the image at path, or nil if it can't
+// be loaded.
+func loadStill(path string) *image.RGBA {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	d, _, err := image.Decode(f)
+	if err != nil {
+		return nil
+	}
+	return toRGBA(d)
 }
 
 // Sized returns the file at path stretched to w×h, or nil if it can't be

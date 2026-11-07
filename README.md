@@ -34,6 +34,16 @@ games/
       <row>/<n>-1.png, <n>-2.png  an icon with several stages
     gifs/
       <n>.gif       shown when icon <n> is clicked
+    overlays/
+      <name>.png    drawn behind everything else (optional)
 settings/
 ```
+
+## Controls
+
+- Click an icon to collect it, or move it to its next stage. Right-click it to clear it.
+- Drag the grip to move everything.
+- Shift+drag the character, the item or an overlay to move it.
+- Ctrl+drag an icon to move just that icon.
+- The gear opens the settings. Save keeps sizes and positions for this game.
 
