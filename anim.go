@@ -6,6 +6,7 @@ import (
 	"image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"math"
 	"os"
 	"time"
 
@@ -236,6 +237,22 @@ func loadStill(path string) *image.RGBA {
 // Sized returns the file at path stretched to w×h, or nil if it can't be
 // loaded.
 func (c *AnimCache) Sized(path string, w, h int) *SizedAnim {
+	return c.sized(path, func(image.Rectangle) (int, int) { return w, h })
+}
+
+// SizedHeight returns the file at path scaled to h pixels high, keeping its
+// own shape, or nil if it can't be loaded.
+func (c *AnimCache) SizedHeight(path string, h int) *SizedAnim {
+	return c.sized(path, func(b image.Rectangle) (int, int) {
+		if b.Dy() <= 0 {
+			return h, h
+		}
+		return max(int(math.Round(float64(h)*float64(b.Dx())/float64(b.Dy()))), 1), h
+	})
+}
+
+// sized returns the file at path at the size given for its own bounds.
+func (c *AnimCache) sized(path string, size func(image.Rectangle) (int, int)) *SizedAnim {
 	if path == "" {
 		return nil
 	}
@@ -247,9 +264,19 @@ func (c *AnimCache) Sized(path string, w, h int) *SizedAnim {
 			break
 		}
 	}
+	var src *animSource
+	if s != nil {
+		src = s.src
+	} else {
+		src = loadSource(path)
+	}
+	var w, h int
+	if src != nil {
+		w, h = size(src.bounds)
+	}
 	switch {
 	case s == nil:
-		s = newSized(path, loadSource(path), w, h)
+		s = newSized(path, src, w, h)
 	case s.w != w || s.h != h:
 		// Only the latest size is kept, since sizes change continuously
 		// while a size slider is dragged.
