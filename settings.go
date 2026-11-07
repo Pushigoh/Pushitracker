@@ -24,6 +24,9 @@ const (
 	// DefaultIconSpacing is the space between icons in a row.
 	DefaultIconSpacing = 10
 	MaxRowSpacing      = 64
+	MinRewardSeconds   = 1
+	MaxRewardSeconds   = 60
+	MaxItemDelayMs     = 10000
 	MinOverlaySize     = 10 // percent of the overlay's own size
 	MaxOverlaySize     = 400
 )
@@ -46,11 +49,16 @@ type Settings struct {
 // <settings folder>/<game>.json and written when Save is pressed in the
 // settings panel.
 type GameSettings struct {
-	IconSize    int     `json:"iconSize"`
-	IconSpacing int     `json:"iconSpacing"`   // space between icons in a row
-	RowSpacing  int     `json:"rowSpacing"`    // space between rows
-	CharSize    int     `json:"characterSize"` // height in px
-	ItemSize    int     `json:"itemSize"`
+	IconSize    int `json:"iconSize"`
+	IconSpacing int `json:"iconSpacing"`   // space between icons in a row
+	RowSpacing  int `json:"rowSpacing"`    // space between rows
+	CharSize    int `json:"characterSize"` // height in px
+	ItemSize    int `json:"itemSize"`
+	// How long the character and item show a clicked icon's gifs, in seconds.
+	RewardSeconds int `json:"rewardSeconds"`
+	// How long after a click the item display changes; the character
+	// changes at once.
+	ItemDelayMs int     `json:"itemDelayMs"`
 	AlwaysOnTop bool    `json:"alwaysOnTop"`
 	TrackerPos  *[2]int `json:"trackerPos,omitempty"`
 	CharPos     *[2]int `json:"characterPos,omitempty"`
@@ -101,6 +109,8 @@ func (s *Settings) LoadGameSettings(game string) *GameSettings {
 	g := &GameSettings{
 		IconSize: DefaultIconSize, IconSpacing: DefaultIconSpacing,
 		CharSize: DefaultCharSize, ItemSize: DefaultItemSize, path: s.gamePath(game),
+		// Until set here, the time from settings.json (8 seconds by default).
+		RewardSeconds: s.DisplaySeconds,
 	}
 	if b, err := os.ReadFile(g.path); err == nil {
 		_ = json.Unmarshal(b, g)
@@ -110,6 +120,8 @@ func (s *Settings) LoadGameSettings(game string) *GameSettings {
 	g.ItemSize = clampSize(g.ItemSize, MinItemSize, MaxItemSize, DefaultItemSize)
 	g.IconSpacing = min(max(g.IconSpacing, 0), MaxIconSpacing)
 	g.RowSpacing = min(max(g.RowSpacing, 0), MaxRowSpacing)
+	g.RewardSeconds = min(max(g.RewardSeconds, MinRewardSeconds), MaxRewardSeconds)
+	g.ItemDelayMs = min(max(g.ItemDelayMs, 0), MaxItemDelayMs)
 	for k, v := range g.OverlaySize {
 		g.OverlaySize[k] = clampSize(v, MinOverlaySize, MaxOverlaySize, 100)
 	}

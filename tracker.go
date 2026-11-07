@@ -19,9 +19,7 @@ const (
 	barHeight   = 26
 	barButton   = 24
 	barGap      = 6
-	itemIndent  = 65  // where the item display starts, until it is dragged
-	charWidth   = 250 // character box shape; its height is the character size
-	charHeight  = 350
+	itemIndent  = 65 // where the item display starts, until it is dragged
 	panelWidth  = 240
 	panelPad    = 10
 	fieldH      = 28
@@ -180,12 +178,16 @@ type Tracker struct {
 	overlays     []*image.RGBA
 	overlayScale float64
 
-	started   time.Time // when the tracker opened; the game's idle image plays from here
-	itemPath  string
-	itemStart time.Time
-	charPath  string
-	charStart time.Time
-	resetAt   time.Time
+	started time.Time // when the tracker opened; the game's idle image plays from here
+	// The clicked item being shown (empty for the idle image), and the one
+	// to show once the item delay is up (empty for none).
+	itemPath   string
+	itemStart  time.Time
+	nextItem   string
+	nextItemAt time.Time
+	charPath   string
+	charStart  time.Time
+	resetAt    time.Time
 
 	panelOpen bool
 	pressed   int      // icon index held down, -1 if none
@@ -267,6 +269,16 @@ func NewTracker(sel *Selection) *Tracker {
 			},
 		},
 		{
+			section: "Character & item", label: "Reward time", unit: "s", min: MinRewardSeconds, max: MaxRewardSeconds, step: 1,
+			get: func() int { return t.gs.RewardSeconds },
+			set: func(n int) { t.gs.RewardSeconds = n },
+		},
+		{
+			section: "Character & item", label: "Item delay", unit: "ms", min: 0, max: MaxItemDelayMs, step: 100,
+			get: func() int { return t.gs.ItemDelayMs },
+			set: func(n int) { t.gs.ItemDelayMs = n },
+		},
+		{
 			section: "Character & item", label: "Item size", unit: "px", min: MinItemSize, max: MaxItemSize, step: 5,
 			get: func() int { return t.gs.ItemSize },
 			set: func(n int) { t.gs.ItemSize, t.itemExact = n, float64(n) },
@@ -293,12 +305,11 @@ func NewTracker(sel *Selection) *Tracker {
 	t.tracks = make([]image.Rectangle, len(t.controls))
 
 	t.started = time.Now()
-	t.charPath, t.charStart = filepath.Join(t.charDir, idleGif), t.started
+	t.charPath, t.charStart = characterImage(t.charDir, idleName), t.started
 	return t
 }
 
-func (t *Tracker) charFile(id string) string { return filepath.Join(t.charDir, id+".gif") }
-func (t *Tracker) gifFile(id string) string  { return filepath.Join(t.game.GifsDir, id+".gif") }
+func (t *Tracker) gifFile(id string) string { return filepath.Join(t.game.GifsDir, id+".gif") }
 
 func (t *Tracker) px(dp float64) int { return int(math.Round(dp * t.scale)) }
 
@@ -582,11 +593,9 @@ func (t *Tracker) PanelOffset() image.Point {
 	return image.Pt(l.gear.Max.X-t.PanelSize().X, l.gear.Max.Y+t.px(6))
 }
 
-// CharacterSize is the character window's size in pixels.
-func (t *Tracker) CharacterSize() image.Point {
-	h := t.px(float64(t.charSize()))
-	return image.Pt(int(math.Round(float64(h)*charWidth/charHeight)), h)
-}
+// CharacterHeight is the character's height in pixels. Its width is each
+// gif's own, at that height.
+func (t *Tracker) CharacterHeight() int { return t.px(float64(t.charSize())) }
 
 // ItemSize is the item display window's size in pixels.
 func (t *Tracker) ItemSize() image.Point {
@@ -610,7 +619,11 @@ func (t *Tracker) CharacterOffset() image.Point {
 func (t *Tracker) tick(now time.Time) {
 	if !t.resetAt.IsZero() && !now.Before(t.resetAt) {
 		t.resetAt = time.Time{}
-		t.charPath, t.charStart = filepath.Join(t.charDir, idleGif), now
+		t.charPath, t.charStart = characterImage(t.charDir, idleName), now
+		t.itemPath, t.nextItem = "", ""
+	}
+	if t.nextItem != "" && !now.Before(t.nextItemAt) {
+		t.itemPath, t.itemStart, t.nextItem = t.nextItem, t.nextItemAt, ""
 	}
 }
 
@@ -684,9 +697,13 @@ func (t *Tracker) RenderItem(now time.Time) (*image.RGBA, time.Time) {
 	t.tick(now)
 	// No fill: transparent parts click through to whatever is behind, such
 	// as the icons.
+	// Until a clicked item's delay is up, whatever was showing stays.
 	path, start, until := t.game.IdlePath, t.started, time.Time{}
-	if !t.resetAt.IsZero() {
+	if t.itemPath != "" {
 		path, start, until = t.itemPath, t.itemStart, t.resetAt
+	}
+	if t.nextItem != "" && (until.IsZero() || t.nextItemAt.Before(until)) {
+		until = t.nextItemAt
 	}
 	return t.animFrame(path, t.ItemSize(), start, until, now)
 }
@@ -695,7 +712,11 @@ func (t *Tracker) RenderItem(now time.Time) (*image.RGBA, time.Time) {
 // The returned image may be a cached frame, so it must not be changed.
 func (t *Tracker) RenderCharacter(now time.Time) (*image.RGBA, time.Time) {
 	t.tick(now)
-	return t.animFrame(t.charPath, t.CharacterSize(), t.charStart, t.resetAt, now)
+	a := t.cache.SizedHeight(t.charPath, t.CharacterHeight())
+	if a == nil {
+		return image.NewRGBA(image.Rect(0, 0, 1, 1)), t.resetAt
+	}
+	return t.frameOf(a, t.charStart, t.resetAt, now)
 }
 
 // animFrame returns the frame of the file at path that is due at now, played
@@ -706,6 +727,11 @@ func (t *Tracker) animFrame(path string, size image.Point, start, until, now tim
 	if a == nil {
 		return image.NewRGBA(image.Rectangle{Max: size}), until
 	}
+	return t.frameOf(a, start, until, now)
+}
+
+// frameOf is animFrame for an already sized file.
+func (t *Tracker) frameOf(a *SizedAnim, start, until, now time.Time) (*image.RGBA, time.Time) {
 	frame, d := a.Frame(now.Sub(start))
 	if d > 0 && (until.IsZero() || now.Add(d).Before(until)) {
 		until = now.Add(d)
@@ -774,7 +800,10 @@ func (t *Tracker) renderPanel(img *image.RGBA, panel image.Rectangle, now time.T
 func (t *Tracker) renderControl(img *image.RGBA, i int, inner image.Rectangle, y int, now time.Time, wake func(time.Time)) int {
 	c := t.controls[i]
 	fh := t.px(fieldH)
-	unitW := font.MeasureString(t.face, "px").Ceil() // the units share a column
+	unitW := 0 // the units share a column, as wide as the widest
+	for _, c := range t.controls {
+		unitW = max(unitW, font.MeasureString(t.face, c.unit).Ceil())
+	}
 	fx1 := inner.Max.X - unitW - t.px(6)
 	field := image.Rect(fx1-t.px(58), y, fx1, y+fh)
 	drawText(img, t.face, fitText(t.face, c.label, field.Min.X-t.px(8)-inner.Min.X), inner.Min.X, y+fh/2, colFg)
@@ -928,14 +957,18 @@ func (t *Tracker) MouseUp(surf Surface, p image.Point, now time.Time) {
 	s := t.icons[i]
 	s.advance(now)
 	id := s.def.Stages[s.shownStage()].ID
-	t.itemPath, t.itemStart = t.gifFile(id), now
-	// The character reacts with <id>.gif if it has one, otherwise reward.gif.
-	t.charPath, t.charStart = t.charFile(id), now
-	if !fileExists(t.charPath) {
-		t.charPath = filepath.Join(t.charDir, rewardGif)
+	delay := time.Duration(t.gs.ItemDelayMs) * time.Millisecond
+	t.nextItem, t.nextItemAt = t.gifFile(id), now.Add(delay)
+	// The character reacts with its <id> image if it has one, otherwise its
+	// reward image.
+	t.charPath, t.charStart = characterImage(t.charDir, id), now
+	if t.charPath == "" {
+		t.charPath = characterImage(t.charDir, rewardName)
 	}
-	// One shared deadline: a new click restarts the display timer.
-	t.resetAt = now.Add(time.Duration(t.settings.DisplaySeconds) * time.Second)
+	// One shared deadline, the reward time after the item appears: a new
+	// click restarts it.
+	t.resetAt = t.nextItemAt.Add(time.Duration(t.gs.RewardSeconds) * time.Second)
+	t.tick(now) // with no delay, the item shows now
 }
 
 // RightClick turns the icon at p back to grey (not collected), without

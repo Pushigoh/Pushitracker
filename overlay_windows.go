@@ -752,7 +752,7 @@ func (o *overlay) resetPositions() {
 	co, io := o.t.CharacterOffset(), o.t.ItemOffset()
 	o.itemOff = [2]float64{float64(io.X - co.X), float64(io.Y - co.Y)}
 	// Already at the new sizes, so followResize leaves the offset alone.
-	o.charH, o.itemPx = o.t.CharacterSize().Y, o.t.ItemSize().Y
+	o.charH, o.itemPx = o.t.CharacterHeight(), o.t.ItemSize().Y
 	o.moveChar(point{m.x + int32(co.X), m.y + int32(co.Y)})
 	o.panelOffSet, o.panelMoved = false, false
 	if o.panelShown {
@@ -1140,7 +1140,7 @@ func (o *overlay) schedule() {
 // so the pair grows downwards, away from the icons. Resizing just the item
 // keeps it centred where it was.
 func (o *overlay) followResize() {
-	ch, ip := o.t.CharacterSize().Y, o.t.ItemSize().Y
+	ch, ip := o.t.CharacterHeight(), o.t.ItemSize().Y
 	switch {
 	case o.charH > 0 && ch != o.charH:
 		r := float64(ch) / float64(o.charH)

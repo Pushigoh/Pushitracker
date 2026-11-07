@@ -22,7 +22,7 @@ Put these next to `pushitracker.exe`:
 ```
 pushitracker.exe
 characters/
-  <character>/
+  <character>/      optional; each image can be a .gif, .png or .jpg
     idle.gif        shown at rest
     reward.gif      shown when an icon is clicked
     <n>.gif         shown instead of reward.gif for icon <n> (optional)

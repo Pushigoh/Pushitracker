@@ -91,6 +91,7 @@ type configWindow struct {
 	gamesBtn    widget.Clickable
 	settingsBtn widget.Clickable
 	startBtn    widget.Clickable
+	noChar      bool // no character was chosen on purpose
 	list        widget.List
 }
 
@@ -117,11 +118,11 @@ func runConfigWindow(th *material.Theme, s *Settings) *Selection {
 			if !started {
 				return nil
 			}
-			return &Selection{
-				Game:     c.game,
-				CharDir:  filepath.Join(c.settings.CharsDir, c.settings.Character),
-				Settings: c.settings,
+			sel := &Selection{Game: c.game, Settings: c.settings}
+			if c.settings.Character != "" {
+				sel.CharDir = filepath.Join(c.settings.CharsDir, c.settings.Character)
 			}
+			return sel
 		case app.FrameEvent:
 			gtx := app.NewContext(&ops, e)
 			if c.update(gtx, w) {
@@ -142,13 +143,14 @@ func (c *configWindow) rescan() {
 	c.chars, c.charsErr = reuseChoices(c.chars, names, func(n string) string { return characterLabel(s.CharsDir, n) }), err
 	if !c.hasChoice(c.chars, s.Character) {
 		s.Character = ""
-		if len(c.chars) == 1 {
+		// The only character is picked for you, unless you just chose none.
+		if len(c.chars) == 1 && !c.noChar {
 			s.Character = c.chars[0].name
 		}
 	}
 	c.charGifs = 0
 	if s.Character != "" {
-		c.charGifs = countGifs(filepath.Join(s.CharsDir, s.Character))
+		c.charGifs = countCharImages(filepath.Join(s.CharsDir, s.Character))
 	}
 
 	names, err = ListGames(s.GamesDir)
@@ -196,8 +198,10 @@ func (c *configWindow) hasChoice(list []*choice, name string) bool {
 	return false
 }
 
+// canStart reports whether there is a game to track. A character is
+// optional: without one the tracker shows just the icons and item.
 func (c *configWindow) canStart() bool {
-	return c.game != nil && c.settings.Character != "" && c.charGifs > 0
+	return c.game != nil
 }
 
 func (c *configWindow) browse(w *app.Window, kind pickKind, start, title string) {
@@ -267,7 +271,12 @@ func (c *configWindow) update(gtx layout.Context, w *app.Window) bool {
 	}
 	for _, ch := range c.chars {
 		if ch.click.Clicked(gtx) {
-			s.Character = ch.name
+			// Clicking the chosen character again chooses none.
+			if s.Character == ch.name {
+				s.Character, c.noChar = "", true
+			} else {
+				s.Character, c.noChar = ch.name, false
+			}
 			c.rescan()
 		}
 	}
@@ -327,13 +336,13 @@ func (c *configWindow) layout(gtx layout.Context) layout.Dimensions {
 		})
 	}
 
-	charStatus := "Pick a character"
+	charStatus := "No character (optional)"
 	if s.Character != "" {
-		charStatus = fmt.Sprintf("%s: %d gifs", characterLabel(s.CharsDir, s.Character), c.charGifs)
+		charStatus = fmt.Sprintf("%s: %d images", characterLabel(s.CharsDir, s.Character), c.charGifs)
 		dir := filepath.Join(s.CharsDir, s.Character)
-		for _, f := range []string{idleGif, rewardGif} {
-			if !fileExists(filepath.Join(dir, f)) {
-				charStatus += ", no " + f
+		for _, f := range []string{idleName, rewardName} {
+			if characterImage(dir, f) == "" {
+				charStatus += ", no " + f + " image"
 			}
 		}
 	}

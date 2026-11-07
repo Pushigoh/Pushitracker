@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -137,18 +138,36 @@ func (g *Game) IconCount() int {
 	return n
 }
 
-// Character gifs every character folder should have.
+// Images every character folder should have, as .gif, .png or .jpg.
 const (
-	idleGif   = "idle.gif"   // shown at rest
-	rewardGif = "reward.gif" // shown on a click when there is no <id>.gif
+	idleName   = "idle"   // shown at rest
+	rewardName = "reward" // shown on a click when there is no <id> image
 )
 
-// thisFolder names a characters folder that holds one character's gifs
+// charExts are the kinds of character image, in the order they are looked
+// for: a gif wins over a png or jpg of the same name.
+var charExts = []string{".gif", ".png", ".jpg", ".jpeg"}
+
+// characterImage returns the path of the character image called name in dir,
+// or "" if there is none (or no character).
+func characterImage(dir, name string) string {
+	if dir == "" {
+		return ""
+	}
+	for _, ext := range charExts {
+		if p := filepath.Join(dir, name+ext); fileExists(p) {
+			return p
+		}
+	}
+	return ""
+}
+
+// thisFolder names a characters folder that holds one character's images
 // directly instead of a folder per character.
 const thisFolder = "."
 
 // ListCharacters returns the character folders in the characters folder. If
-// it has no subfolders but does have gifs, it is itself the one character.
+// it has no subfolders but does have images, it is itself the one character.
 func ListCharacters(charsDir string) ([]string, error) {
 	if charsDir == "" {
 		return nil, fmt.Errorf("no characters folder selected")
@@ -157,7 +176,7 @@ func ListCharacters(charsDir string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(chars) == 0 && countGifs(charsDir) > 0 {
+	if len(chars) == 0 && countCharImages(charsDir) > 0 {
 		chars = []string{thisFolder}
 	}
 	if len(chars) == 0 {
@@ -173,11 +192,12 @@ func characterLabel(charsDir, name string) string {
 	return name
 }
 
-func countGifs(dir string) int {
+// countCharImages counts the character images in dir.
+func countCharImages(dir string) int {
 	entries, _ := os.ReadDir(dir)
 	n := 0
 	for _, e := range entries {
-		if !e.IsDir() && strings.EqualFold(filepath.Ext(e.Name()), ".gif") {
+		if !e.IsDir() && slices.Contains(charExts, strings.ToLower(filepath.Ext(e.Name()))) {
 			n++
 		}
 	}
