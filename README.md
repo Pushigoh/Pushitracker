@@ -43,7 +43,7 @@ settings/
 
 - Click an icon to collect it, or move it to its next stage. Right-click it to clear it.
 - Drag the grip to move everything.
-- Shift+drag the character, the item or an overlay to move it. Shift+drag an icon to move the overlay behind it.
+- Shift+drag the character, the item or an overlay to move it.
 - Ctrl+drag an icon to move just that icon.
 - The gear opens the settings. Save keeps sizes and positions for this game.
 
