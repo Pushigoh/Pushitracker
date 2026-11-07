@@ -44,6 +44,7 @@ settings/
 - Click an icon to collect it, or move it to its next stage. Right-click it to clear it.
 - Drag the grip to move everything.
 - Shift+drag the character, the item or an overlay to move it.
-- Ctrl+drag an icon to move just that icon.
+- Ctrl+drag an icon to move just that icon, or Alt+drag it to move its whole row.
+- Ctrl+Z undoes the last move.
 - The gear opens the settings. Save keeps sizes and positions for this game.
 

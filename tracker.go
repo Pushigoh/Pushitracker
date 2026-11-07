@@ -3,6 +3,7 @@ package main
 import (
 	"image"
 	"image/color"
+	"maps"
 	"math"
 	"path/filepath"
 	"strconv"
@@ -250,6 +251,11 @@ func NewTracker(sel *Selection) *Tracker {
 			set: func(n int) { t.gs.IconSpacing = n },
 		},
 		{
+			section: "Icons", label: "Row spacing", unit: "px", min: 0, max: MaxRowSpacing, step: 1,
+			get: func() int { return t.gs.RowSpacing },
+			set: func(n int) { t.gs.RowSpacing = n },
+		},
+		{
 			section: "Character & item", label: "Character size", unit: "px", min: MinCharSize, max: MaxCharSize, step: 10,
 			get: t.charSize,
 			set: func(n int) {
@@ -322,7 +328,7 @@ func (t *Tracker) closePanel() {
 func (t *Tracker) ResetLayout() {
 	t.editIdx = -1
 	t.gs.IconSize, t.gs.CharSize, t.gs.ItemSize = DefaultIconSize, DefaultCharSize, DefaultItemSize
-	t.gs.IconSpacing = DefaultIconSpacing
+	t.gs.IconSpacing, t.gs.RowSpacing = DefaultIconSpacing, 0
 	t.gs.IconPos = nil
 	t.gs.OverlayPos = nil
 	t.gs.OverlaySize = nil
@@ -451,11 +457,16 @@ func (t *Tracker) layout() trackerLayout {
 	contentW := t.px(panelWidth)
 	y := m + t.px(barHeight) + t.px(barGap)
 	l.icons = make([]image.Rectangle, len(t.icons))
+	rowGap, first := t.px(float64(t.gs.RowSpacing)), true
 	for r := 0; r+1 < len(t.rowStart); r++ {
 		from, to := t.rowStart[r], t.rowStart[r+1]
 		if from == to {
 			continue // empty rows take no space
 		}
+		if !first {
+			y += rowGap
+		}
+		first = false
 		x := m
 		for i := from; i < to; i++ {
 			l.icons[i] = image.Rect(x, y, x+icon, y+icon).Add(t.iconShift(i))
@@ -497,6 +508,26 @@ func (t *Tracker) IconAt(p image.Point) int {
 	}
 	return -1
 }
+
+// RowOf returns the icons in the same row as icon i.
+func (t *Tracker) RowOf(i int) []int {
+	for r := 0; r+1 < len(t.rowStart); r++ {
+		if from, to := t.rowStart[r], t.rowStart[r+1]; i >= from && i < to {
+			row := make([]int, 0, to-from)
+			for j := from; j < to; j++ {
+				row = append(row, j)
+			}
+			return row
+		}
+	}
+	return []int{i}
+}
+
+// IconPositions and SetIconPositions get and put back where every icon has
+// been dragged to, for undo.
+func (t *Tracker) IconPositions() map[string][2]float64 { return maps.Clone(t.gs.IconPos) }
+
+func (t *Tracker) SetIconPositions(p map[string][2]float64) { t.gs.IconPos = maps.Clone(p) }
 
 // IconOffset is how far icon i has been dragged from its place in its row,
 // in icon sizes.
