@@ -27,6 +27,8 @@ const (
 	sliderH     = 24
 	rowH        = 24
 	btnH        = 28
+	sectionH    = 24 // a settings section's heading
+	sectionGap  = 12 // extra space above a section after the first, with a line in it
 	fadeTime    = 300 * time.Millisecond
 	caretBlink  = 530 * time.Millisecond
 	minAlphaHit = 1 // nearly invisible, but keeps icon gaps clickable
@@ -147,6 +149,7 @@ func (s *iconState) shownStage() int { return max(s.stage, 0) }
 
 // sizeControl is one "label [field] px" + slider block in the settings panel.
 type sizeControl struct {
+	section  string // the heading it sits under
 	label    string
 	unit     string
 	min, max int
@@ -234,7 +237,7 @@ func NewTracker(sel *Selection) *Tracker {
 
 	t.controls = []*sizeControl{
 		{
-			label: "Icon size", unit: "px", min: MinIconSize, max: MaxIconSize, step: 1,
+			section: "Icons", label: "Icon size", unit: "px", min: MinIconSize, max: MaxIconSize, step: 1,
 			get: t.iconSize,
 			set: func(n int) {
 				t.gs.IconSize = n
@@ -242,12 +245,12 @@ func NewTracker(sel *Selection) *Tracker {
 			},
 		},
 		{
-			label: "Icon spacing", unit: "px", min: 0, max: MaxIconSpacing, step: 1,
+			section: "Icons", label: "Icon spacing", unit: "px", min: 0, max: MaxIconSpacing, step: 1,
 			get: func() int { return t.gs.IconSpacing },
 			set: func(n int) { t.gs.IconSpacing = n },
 		},
 		{
-			label: "Character size", unit: "px", min: MinCharSize, max: MaxCharSize, step: 10,
+			section: "Character & item", label: "Character size", unit: "px", min: MinCharSize, max: MaxCharSize, step: 10,
 			get: t.charSize,
 			set: func(n int) {
 				// The item above the character's head grows and shrinks with it.
@@ -258,14 +261,14 @@ func NewTracker(sel *Selection) *Tracker {
 			},
 		},
 		{
-			label: "Item size", unit: "px", min: MinItemSize, max: MaxItemSize, step: 5,
+			section: "Character & item", label: "Item size", unit: "px", min: MinItemSize, max: MaxItemSize, step: 5,
 			get: func() int { return t.gs.ItemSize },
 			set: func(n int) { t.gs.ItemSize, t.itemExact = n, float64(n) },
 		},
 	}
 	for i, ov := range t.game.Overlays {
 		t.controls = append(t.controls, &sizeControl{
-			label: "Overlay " + ov.Name, unit: "%", min: MinOverlaySize, max: MaxOverlaySize, step: 5,
+			section: "Overlays", label: ov.Name, unit: "%", min: MinOverlaySize, max: MaxOverlaySize, step: 5,
 			get: func() int { return t.overlaySize(i) },
 			set: func(n int) {
 				if n == 100 {
@@ -523,7 +526,22 @@ func (t *Tracker) PanelSize() image.Point {
 	block := t.px(fieldH) + t.px(6) + t.px(sliderH)
 	h := pad + len(t.controls)*block + (len(t.controls)-1)*t.px(12) +
 		t.px(12) + t.px(rowH) + 3*(t.px(12)+t.px(btnH)) + pad
+	for i := range t.controls {
+		h += t.headingSpace(i)
+	}
 	return image.Pt(t.px(panelWidth), h)
+}
+
+// headingSpace is the room taken above control i by a section heading (and
+// the line above it, after the first section), or 0 if it doesn't start one.
+func (t *Tracker) headingSpace(i int) int {
+	switch {
+	case i == 0:
+		return t.px(sectionH)
+	case t.controls[i].section != t.controls[i-1].section:
+		return t.px(sectionGap) + t.px(sectionH)
+	}
+	return 0
 }
 
 // PanelOffset is where the settings panel opens relative to the tracker's
@@ -671,7 +689,16 @@ func (t *Tracker) renderPanel(img *image.RGBA, panel image.Rectangle, now time.T
 
 	inner := panel.Inset(t.px(panelPad))
 	y := inner.Min.Y
-	for i := range t.controls {
+	for i, c := range t.controls {
+		if h := t.headingSpace(i); h > 0 {
+			if i > 0 {
+				// A line between sections, in the middle of the gap.
+				ly := y - t.px(12)/2 + t.px(sectionGap)/2
+				fillSolid(img, image.Rect(inner.Min.X, ly, inner.Max.X, ly+max(1, t.px(1))), colPanelBorder)
+			}
+			y += h
+			drawText(img, t.face, c.section, inner.Min.X, y-t.px(sectionH)/2-t.px(2), colMuted)
+		}
 		y = t.renderControl(img, i, inner, y, now, wake) + t.px(12)
 	}
 
