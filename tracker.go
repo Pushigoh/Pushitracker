@@ -169,6 +169,11 @@ type Tracker struct {
 	iconKeys []string // each icon's name in the settings file: "<row>/<icon>"
 	rowStart []int    // index into icons where each row starts
 
+	// The overlays at the current scale; they are built once per scale
+	// since they don't change.
+	overlays     []*image.RGBA
+	overlayScale float64
+
 	started   time.Time // when the tracker opened; the game's idle image plays from here
 	itemPath  string
 	itemStart time.Time
@@ -290,6 +295,7 @@ func (t *Tracker) closePanel() {
 func (t *Tracker) ResetLayout() {
 	t.gs.IconSize, t.gs.CharSize, t.gs.ItemSize = DefaultIconSize, DefaultCharSize, DefaultItemSize
 	t.gs.IconPos = nil
+	t.gs.OverlayPos = nil
 	t.itemExact = DefaultItemSize
 	t.prepare()
 }
@@ -326,7 +332,43 @@ func (t *Tracker) prepare() {
 	if t.faceScale != t.scale {
 		t.face, t.faceScale = newFace(13*t.scale), t.scale
 	}
+	if t.overlayScale != t.scale {
+		t.overlayScale = t.scale
+		t.overlays = t.overlays[:0]
+		for _, ov := range t.game.Overlays {
+			// Loaded straight from disk, not cached: an overlay can be big,
+			// and only the scaled copy is needed.
+			img := loadStill(ov.Path)
+			if img == nil {
+				img = image.NewRGBA(image.Rectangle{})
+			} else if t.scale != 1 {
+				w, h := t.px(float64(img.Rect.Dx())), t.px(float64(img.Rect.Dy()))
+				img = scaleTo(img, max(w, 1), max(h, 1), xdraw.CatmullRom)
+			}
+			t.overlays = append(t.overlays, img)
+		}
+	}
 }
+
+// Overlays returns the game's overlays at the current scale. They don't
+// change, so the window draws them once.
+func (t *Tracker) Overlays() []*image.RGBA { return t.overlays }
+
+// OverlayOffsets are where the overlays start relative to the tracker's
+// top-left corner, until they are dragged: one under another, starting where
+// the icons do.
+func (t *Tracker) OverlayOffsets() []image.Point {
+	offs := make([]image.Point, len(t.overlays))
+	y := t.px(margin) + t.px(barHeight) + t.px(barGap)
+	for i, img := range t.overlays {
+		offs[i] = image.Pt(t.px(margin), y)
+		y += img.Rect.Dy()
+	}
+	return offs
+}
+
+// OverlayName is what overlay i's position is saved under.
+func (t *Tracker) OverlayName(i int) string { return t.game.Overlays[i].Name }
 
 // setControl applies a value to control i; it reports whether it changed.
 func (t *Tracker) setControl(i, n int) bool {

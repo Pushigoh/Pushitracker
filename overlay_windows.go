@@ -17,8 +17,9 @@ import (
 // shows through wherever it is transparent, and clicks there pass through to
 // what's behind. The icons, the character and the item display above its
 // head are all drawn in this one window, so capturing it (in OBS, say) shows
-// all of them. Each can still be dragged on its own, and so can each icon
-// with Ctrl held: the window grows to cover wherever they are. The item follows the character when the character
+// all of them, along with the game's overlays behind them. The character,
+// item and overlays can each be dragged with Shift held, and each icon with
+// Ctrl held: the window grows to cover wherever they are. The item follows the character when the character
 // moves or is resized; everything follows the grip. The settings panel has a
 // window of its own, owned by the tracker window.
 
@@ -90,7 +91,9 @@ const (
 	wmExitSizeMove = 0x0232
 	wmDpiChanged   = 0x02E0
 	wmTimer        = 0x0113
+	mkShift        = 0x0004
 	mkControl      = 0x0008
+	vkShift        = 0x10
 	vkControl      = 0x11
 	htCaption      = 2
 	htClient       = 1
@@ -183,7 +186,8 @@ type layered struct {
 	shown   *image.RGBA // the image last pushed
 }
 
-// The parts drawn in the tracker window, bottom to top.
+// The parts drawn in the tracker window. The overlays come after these, as
+// parts numParts on, and are drawn below them; see order.
 const (
 	partTracker = iota // the icons and the bar above them
 	partChar
@@ -199,9 +203,11 @@ type overlay struct {
 	// redrawing; zero when it is still until the next input.
 	due [4]time.Time
 
-	// Each part's latest picture, and where it is on screen.
-	parts [numParts]*image.RGBA
-	at    [numParts]point
+	// Each part's latest picture, and where it is on screen; then the parts
+	// in drawing order, bottom to top.
+	parts []*image.RGBA
+	at    []point
+	order []int
 	// Where the tracker window is on screen and its size, as last set, and
 	// the area (on screen) that needs drawing again.
 	origin  point
@@ -281,6 +287,21 @@ func runTracker(t *Tracker) {
 		dpi = 96
 	}
 	t.SetScale(float64(dpi) / 96)
+
+	n := numParts + len(t.Overlays())
+	o.parts, o.at = make([]*image.RGBA, n), make([]point, n)
+	for i := numParts; i < n; i++ {
+		o.order = append(o.order, i)
+	}
+	o.order = append(o.order, partTracker, partChar, partItem)
+
+	// The overlays start one under another until they have been dragged.
+	for i, off := range t.OverlayOffsets() {
+		if p, ok := t.gs.OverlayPos[t.OverlayName(i)]; ok {
+			off = image.Pt(p[0], p[1])
+		}
+		o.at[numParts+i] = point{x + int32(off.X), y + int32(off.Y)}
+	}
 
 	// The character starts under the item display, and the item under the
 	// icons, until they have been dragged.
@@ -379,16 +400,26 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 	case wmDestroy:
 		pPostQuitMessage.Call(0)
 	case wmLButtonDown:
-		p := o.partAt(lParamPoint(lParam))
-		switch {
-		case p == partChar || p == partItem:
-			// Dragging the character brings the item along; dragging the
-			// item moves just the item.
+		pt := lParamPoint(lParam)
+		switch p := o.partAt(pt); {
+		case wParam&mkShift != 0 && p != partTracker && p >= 0:
+			// Shift+drag moves the character (bringing the item along), just
+			// the item, or an overlay.
 			o.dragPart, o.dragFrom, o.dragStart = p, cursorPos(), o.at[p]
-		case p == partTracker && wParam&mkControl != 0 && o.iconAt(lParamPoint(lParam)) >= 0:
+		case wParam&mkShift != 0 && p == partTracker && !o.onChrome(pt):
+			// On an icon, it moves the overlay behind it, if there is one.
+			q := o.overlayAt(pt)
+			if q < 0 {
+				return 0, true
+			}
+			o.dragPart, o.dragFrom, o.dragStart = q, cursorPos(), o.at[q]
+		case wParam&mkControl != 0 && p == partTracker && o.iconAt(pt) >= 0:
 			// Ctrl+drag moves one icon.
-			i := o.iconAt(lParamPoint(lParam))
+			i := o.iconAt(pt)
 			o.dragPart, o.dragFrom, o.dragIcon, o.dragIconFrom = partTracker, cursorPos(), i, o.t.IconOffset(i)
+		case p != partTracker && p >= 0:
+			// Without Shift the character, item and overlays do nothing.
+			return 0, true
 		default:
 			return o.inputProc(SurfMain, hwnd, message, wParam, lParam)
 		}
@@ -408,7 +439,7 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 			o.moveChar(to)
 			o.compose()
 		default:
-			o.movePart(partItem, to)
+			o.movePart(o.dragPart, to)
 			o.compose()
 		}
 	case wmLButtonUp, wmCaptureChg:
@@ -427,8 +458,18 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 			return 0, false
 		}
 		c := clientPoint(hwnd, cursorPos())
-		if p := o.partAt(c); p == partChar || p == partItem || p == partTracker && ctrlDown() && o.iconAt(c) >= 0 {
+		p := o.partAt(c)
+		move := p == partTracker && keyDown(vkControl) && o.iconAt(c) >= 0
+		if keyDown(vkShift) {
+			move = move || p >= 0 && p != partTracker ||
+				p == partTracker && !o.onChrome(c) && o.overlayAt(c) >= 0
+		}
+		switch {
+		case move:
 			setCursor(idcSizeAll)
+			return 1, true
+		case p != partTracker:
+			setCursor(idcArrow)
 			return 1, true
 		}
 		return o.inputProc(SurfMain, hwnd, message, wParam, lParam)
@@ -475,6 +516,14 @@ func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (u
 			g.TrackerPos = savePoint(o.at[partTracker])
 			g.CharPos = savePoint(o.at[partChar])
 			g.ItemPos = savePoint(o.at[partItem])
+			g.OverlayPos = nil
+			m := o.at[partTracker]
+			for i := numParts; i < len(o.at); i++ {
+				if g.OverlayPos == nil {
+					g.OverlayPos = map[string][2]int{}
+				}
+				g.OverlayPos[o.t.OverlayName(i-numParts)] = [2]int{int(o.at[i].x - m.x), int(o.at[i].y - m.y)}
+			}
 			if o.panelShown {
 				var r rect
 				if ok, _, _ := pGetWindowRect.Call(o.panel.hwnd, uintptr(unsafe.Pointer(&r))); ok != 0 {
@@ -564,22 +613,45 @@ func (o *overlay) trackerOff() image.Point {
 // iconAt returns the icon at p, in tracker window coordinates, or -1.
 func (o *overlay) iconAt(p image.Point) int { return o.t.IconAt(p.Sub(o.trackerOff())) }
 
-func ctrlDown() bool {
-	s, _, _ := pGetKeyState.Call(vkControl)
+// onChrome reports whether p, in tracker window coordinates, is on the
+// tracker's grip or gear.
+func (o *overlay) onChrome(p image.Point) bool {
+	k := o.t.Cursor(SurfMain, p.Sub(o.trackerOff()))
+	return k == hitDrag || k == hitGear
+}
+
+func keyDown(vk uintptr) bool {
+	s, _, _ := pGetKeyState.Call(vk)
 	return int16(s) < 0
+}
+
+// overlayAt returns the topmost overlay with a visible pixel at p, in tracker
+// window coordinates, whatever is drawn over it; -1 if there is none.
+func (o *overlay) overlayAt(p image.Point) int {
+	for i := len(o.parts) - 1; i >= numParts; i-- {
+		if o.visibleAt(i, p) {
+			return i
+		}
+	}
+	return -1
+}
+
+// visibleAt reports whether part i has a visible pixel at p, in tracker
+// window coordinates.
+func (o *overlay) visibleAt(i int, p image.Point) bool {
+	img := o.parts[i]
+	if img == nil {
+		return false
+	}
+	q := p.Add(image.Pt(int(o.origin.x-o.at[i].x), int(o.origin.y-o.at[i].y)))
+	return q.In(img.Rect) && img.Pix[img.PixOffset(q.X, q.Y)+3] != 0
 }
 
 // partAt returns the topmost part with a visible pixel at p, in tracker
 // window coordinates, or -1 if there is none.
 func (o *overlay) partAt(p image.Point) int {
-	sp := image.Pt(p.X+int(o.origin.x), p.Y+int(o.origin.y))
-	for i := numParts - 1; i >= 0; i-- {
-		img := o.parts[i]
-		if img == nil {
-			continue
-		}
-		q := sp.Sub(image.Pt(int(o.at[i].x), int(o.at[i].y)))
-		if q.In(img.Rect) && img.Pix[img.PixOffset(q.X, q.Y)+3] != 0 {
+	for k := len(o.order) - 1; k >= 0; k-- {
+		if i := o.order[k]; o.visibleAt(i, p) {
 			return i
 		}
 	}
@@ -634,14 +706,17 @@ func (o *overlay) measureItemOffset() {
 	o.itemOff = [2]float64{float64(i.x - c.x), float64(i.y - c.y)}
 }
 
-// resetPositions moves the character and item back to where they start,
-// relative to the tracker, at their (just reset) sizes.
+// resetPositions moves the character, item and overlays back to where they
+// start, relative to the tracker, at their (just reset) sizes.
 func (o *overlay) resetPositions() {
+	m := o.at[partTracker]
+	for i, off := range o.t.OverlayOffsets() {
+		o.movePart(numParts+i, point{m.x + int32(off.X), m.y + int32(off.Y)})
+	}
 	co, io := o.t.CharacterOffset(), o.t.ItemOffset()
 	o.itemOff = [2]float64{float64(io.X - co.X), float64(io.Y - co.Y)}
 	// Already at the new sizes, so followResize leaves the offset alone.
 	o.charH, o.itemPx = o.t.CharacterSize().Y, o.t.ItemSize().Y
-	m := o.at[partTracker]
 	o.moveChar(point{m.x + int32(co.X), m.y + int32(co.Y)})
 	o.panelOffSet = false
 	if o.panelShown {
@@ -751,6 +826,10 @@ func (o *overlay) draw(which [4]bool) {
 		img, next := o.t.Render(now)
 		o.setPart(partTracker, img)
 		o.due[0] = next
+		// The overlays only change with the scale.
+		for i, img := range o.t.Overlays() {
+			o.setPart(numParts+i, img)
+		}
 	}
 	if which[1] {
 		img, next := o.t.RenderCharacter(now)
@@ -801,7 +880,8 @@ func (o *overlay) compose() {
 	for y := local.Min.Y; y < local.Max.Y; y++ {
 		clear(dst[(y*w+local.Min.X)*4 : (y*w+local.Max.X)*4])
 	}
-	for i, img := range o.parts {
+	for _, i := range o.order {
+		img := o.parts[i]
 		r := o.partRect(i).Intersect(dirty)
 		if img == nil || r.Empty() {
 			continue

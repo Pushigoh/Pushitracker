@@ -17,11 +17,19 @@ import (
 //	games/<game>/icons/<row>/<n>.png   icons, one row per folder
 //	games/<game>/icons/0.png           idle item-display image (optional)
 //	games/<game>/gifs/<n>.gif          item animation on click
+//	games/<game>/overlays/<name>.png   images behind everything (optional)
 type Game struct {
 	Name     string
 	Rows     []Row
 	GifsDir  string
 	IdlePath string
+	Overlays []Overlay
+}
+
+// Overlay is an image drawn behind the icons, character and item.
+type Overlay struct {
+	Name string // file name without extension, which its position is saved under
+	Path string
 }
 
 // Row is one subfolder of a game; every icon in it is drawn on one line.
@@ -46,8 +54,9 @@ type Stage struct {
 
 // Folders inside each game.
 const (
-	iconsFolder = "icons"
-	gifsFolder  = "gifs"
+	iconsFolder    = "icons"
+	gifsFolder     = "gifs"
+	overlaysFolder = "overlays"
 )
 
 var stageName = regexp.MustCompile(`^(.+)-(\d+)$`)
@@ -98,7 +107,26 @@ func LoadGame(gamesDir, name string) (*Game, error) {
 	if len(g.Rows) == 0 {
 		return nil, fmt.Errorf("%s has no row folders", icons)
 	}
+	g.Overlays = scanOverlays(filepath.Join(dir, overlaysFolder))
 	return g, nil
+}
+
+// scanOverlays lists the images in a game's overlays folder, which is
+// optional.
+func scanOverlays(dir string) []Overlay {
+	entries, _ := os.ReadDir(dir)
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && iconExts[strings.ToLower(filepath.Ext(e.Name()))] {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Slice(names, func(i, j int) bool { return natLess(names[i], names[j]) })
+	var overlays []Overlay
+	for _, n := range names {
+		overlays = append(overlays, Overlay{Name: strings.TrimSuffix(n, filepath.Ext(n)), Path: filepath.Join(dir, n)})
+	}
+	return overlays
 }
 
 func (g *Game) IconCount() int {

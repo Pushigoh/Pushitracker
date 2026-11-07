@@ -51,6 +51,8 @@ type GameSettings struct {
 	// Icons dragged out of their place in their row: how far, in icon
 	// sizes, by "<row>/<icon>".
 	IconPos map[string][2]float64 `json:"iconPositions,omitempty"`
+	// Where each overlay is relative to the tracker, by file name.
+	OverlayPos map[string][2]int `json:"overlayPositions,omitempty"`
 
 	path string
 }
