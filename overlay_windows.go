@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"image"
 	"math"
 	"runtime"
@@ -39,6 +41,7 @@ var (
 	pSendMessageW                 = user32.NewProc("SendMessageW")
 	pPostQuitMessage              = user32.NewProc("PostQuitMessage")
 	pSetCapture                   = user32.NewProc("SetCapture")
+	pMessageBoxW                  = user32.NewProc("MessageBoxW")
 	pGetKeyState                  = user32.NewProc("GetKeyState")
 	pSetFocus                     = user32.NewProc("SetFocus")
 	pSetForegroundWindow          = user32.NewProc("SetForegroundWindow")
@@ -230,10 +233,15 @@ type overlay struct {
 	dragIcon     int
 	dragIconFrom [2]float64
 
+	// This game's settings as last saved (or loaded), to tell whether
+	// anything has changed since.
+	saved []byte
+
 	// Where the settings panel sits relative to the tracker, once it has been
 	// opened or loaded from the settings file.
 	panelOff    point
 	panelOffSet bool
+	panelMoved  bool // dragged, or placed from the settings file
 	panelShown  bool
 }
 
@@ -321,7 +329,7 @@ func runTracker(t *Tracker) {
 	// owned by the tracker window: it stays above it, has no taskbar button of
 	// its own, and closes with it.
 	if px, py, ok := savedPosition(t.gs.PanelPos); ok {
-		o.panelOff, o.panelOffSet = point{px - x, py - y}, true
+		o.panelOff, o.panelOffSet, o.panelMoved = point{px - x, py - y}, true, true
 	}
 	panelTitle := windows.StringToUTF16Ptr("Pushitracker settings")
 	o.panel.hwnd, _, _ = pCreateWindowExW.Call(
@@ -330,6 +338,7 @@ func runTracker(t *Tracker) {
 		wsPopup, uintptr(x), uintptr(y), 100, 100, o.main.hwnd, 0, uintptr(instance), 0)
 
 	o.render()
+	o.saved = o.snapshot()
 	o.applyTopmost()
 	pShowWindow.Call(o.main.hwnd, swShow)
 
@@ -396,7 +405,7 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 	case wmMove:
 		o.followMain()
 	case wmClose:
-		pDestroyWindow.Call(hwnd)
+		o.exit()
 	case wmDestroy:
 		pPostQuitMessage.Call(0)
 	case wmLButtonDown:
@@ -485,7 +494,7 @@ func (o *overlay) panelProc(message, wParam, lParam uintptr) (uintptr, bool) {
 	case wmExitSizeMove:
 		o.measurePanelOffset()
 	case wmClose:
-		pDestroyWindow.Call(o.main.hwnd)
+		o.exit()
 	default:
 		return o.inputProc(SurfPanel, o.panel.hwnd, message, wParam, lParam)
 	}
@@ -512,27 +521,15 @@ func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (u
 			pReleaseCapture.Call()
 			pSendMessageW.Call(hwnd, wmNCLButtonDn, htCaption, 0)
 		case ActSave:
-			g := o.t.gs
-			g.TrackerPos = savePoint(o.at[partTracker])
-			g.CharPos = savePoint(o.at[partChar])
-			g.ItemPos = savePoint(o.at[partItem])
-			g.OverlayPos = nil
-			m := o.at[partTracker]
-			for i := numParts; i < len(o.at); i++ {
-				if g.OverlayPos == nil {
-					g.OverlayPos = map[string][2]int{}
-				}
-				g.OverlayPos[o.t.OverlayName(i-numParts)] = [2]int{int(o.at[i].x - m.x), int(o.at[i].y - m.y)}
+			o.save()
+		case ActExit:
+			o.exit()
+			return 0, true
+		case ActConfirmReset:
+			if confirmReset(o.panel.hwnd) {
+				o.t.ResetLayout()
+				o.resetPositions()
 			}
-			if o.panelShown {
-				var r rect
-				if ok, _, _ := pGetWindowRect.Call(o.panel.hwnd, uintptr(unsafe.Pointer(&r))); ok != 0 {
-					g.PanelPos = savePoint(point{r.left, r.top})
-				}
-			}
-			o.t.SaveGame()
-		case ActReset:
-			o.resetPositions()
 		case ActCapture:
 			pSetCapture.Call(hwnd)
 		case ActFocus:
@@ -718,7 +715,7 @@ func (o *overlay) resetPositions() {
 	// Already at the new sizes, so followResize leaves the offset alone.
 	o.charH, o.itemPx = o.t.CharacterSize().Y, o.t.ItemSize().Y
 	o.moveChar(point{m.x + int32(co.X), m.y + int32(co.Y)})
-	o.panelOffSet = false
+	o.panelOffSet, o.panelMoved = false, false
 	if o.panelShown {
 		o.placePanel()
 	}
@@ -741,7 +738,7 @@ func (o *overlay) measurePanelOffset() {
 	var p rect
 	if ok, _, _ := pGetWindowRect.Call(o.panel.hwnd, uintptr(unsafe.Pointer(&p))); ok != 0 {
 		m := o.at[partTracker]
-		o.panelOff, o.panelOffSet = point{p.left - m.x, p.top - m.y}, true
+		o.panelOff, o.panelOffSet, o.panelMoved = point{p.left - m.x, p.top - m.y}, true, true
 	}
 }
 
@@ -765,6 +762,86 @@ func (o *overlay) followMain() {
 	if o.panelShown {
 		o.placePanel()
 	}
+}
+
+// current is this game's settings as Save would write them now, with where
+// everything is.
+func (o *overlay) current() GameSettings {
+	g := *o.t.gs
+	m := o.at[partTracker]
+	g.TrackerPos = savePoint(m)
+	g.CharPos = savePoint(o.at[partChar])
+	g.ItemPos = savePoint(o.at[partItem])
+	g.OverlayPos = nil
+	for i := numParts; i < len(o.at); i++ {
+		if g.OverlayPos == nil {
+			g.OverlayPos = map[string][2]int{}
+		}
+		g.OverlayPos[o.t.OverlayName(i-numParts)] = [2]int{int(o.at[i].x - m.x), int(o.at[i].y - m.y)}
+	}
+	g.PanelPos = nil
+	if o.panelMoved {
+		g.PanelPos = savePoint(point{m.x + o.panelOff.x, m.y + o.panelOff.y})
+	}
+	return g
+}
+
+func (o *overlay) snapshot() []byte {
+	b, _ := json.Marshal(o.current())
+	return b
+}
+
+// save writes this game's settings file.
+func (o *overlay) save() {
+	*o.t.gs = o.current()
+	o.t.SaveGame()
+	o.saved = o.snapshot()
+}
+
+// exit closes the tracker, first asking whether to save if anything has
+// changed since the last Save.
+func (o *overlay) exit() {
+	o.t.FocusLost() // keep a half-typed size
+	if !bytes.Equal(o.snapshot(), o.saved) {
+		switch askSave(o.main.hwnd) {
+		case idYes:
+			o.save()
+		case idNo:
+		default:
+			o.render()
+			return
+		}
+	}
+	pDestroyWindow.Call(o.main.hwnd)
+}
+
+const (
+	mbOKCancel     = 0x1
+	mbYesNoCancel  = 0x3
+	mbIconQuestion = 0x20
+	mbDefButton2   = 0x100
+	mbTopmost      = 0x40000
+	idOK           = 1
+	idYes          = 6
+	idNo           = 7
+)
+
+// askSave asks whether to save before exiting: idYes, idNo or idCancel.
+func askSave(owner uintptr) uintptr {
+	text := windows.StringToUTF16Ptr("Save your changes to this game's layout and settings before exiting?")
+	title := windows.StringToUTF16Ptr("Unsaved changes")
+	r, _, _ := pMessageBoxW.Call(owner, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(title)),
+		mbYesNoCancel|mbIconQuestion|mbTopmost)
+	return r
+}
+
+// confirmReset asks before Reset layout puts everything back.
+func confirmReset(owner uintptr) bool {
+	text := windows.StringToUTF16Ptr("Put all sizes and positions back to their defaults?\n\nNothing is written to the settings file until you press Save.")
+	title := windows.StringToUTF16Ptr("Reset layout")
+	r, _, _ := pMessageBoxW.Call(owner, uintptr(unsafe.Pointer(text)), uintptr(unsafe.Pointer(title)),
+		mbOKCancel|mbIconQuestion|mbDefButton2|mbTopmost)
+	return r == idOK
 }
 
 func cursorPos() point {

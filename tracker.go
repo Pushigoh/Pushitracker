@@ -18,7 +18,6 @@ const (
 	barHeight   = 26
 	barButton   = 24
 	barGap      = 6
-	iconGap     = 10
 	itemIndent  = 65  // where the item display starts, until it is dragged
 	charWidth   = 250 // character box shape; its height is the character size
 	charHeight  = 350
@@ -85,8 +84,9 @@ const (
 	ActFocus
 	ActTopmost
 	ActSave
-	ActReset
+	ActConfirmReset // ask first, then reset (see ResetLayout)
 	ActClose
+	ActExit // close, asking first if there are unsaved changes
 )
 
 // Virtual-key codes the size fields understand.
@@ -148,6 +148,7 @@ func (s *iconState) shownStage() int { return max(s.stage, 0) }
 // sizeControl is one "label [field] px" + slider block in the settings panel.
 type sizeControl struct {
 	label    string
+	unit     string
 	min, max int
 	step     int // for arrow keys and the mouse wheel
 	get      func() int
@@ -169,8 +170,9 @@ type Tracker struct {
 	iconKeys []string // each icon's name in the settings file: "<row>/<icon>"
 	rowStart []int    // index into icons where each row starts
 
-	// The overlays at the current scale; they are built once per scale
-	// since they don't change.
+	// The overlays as loaded, and at their current size. They are scaled
+	// only when the display scale or their size setting changes.
+	overlaySrc   []*image.RGBA
 	overlays     []*image.RGBA
 	overlayScale float64
 
@@ -232,7 +234,7 @@ func NewTracker(sel *Selection) *Tracker {
 
 	t.controls = []*sizeControl{
 		{
-			label: "Icon size", min: MinIconSize, max: MaxIconSize, step: 1,
+			label: "Icon size", unit: "px", min: MinIconSize, max: MaxIconSize, step: 1,
 			get: t.iconSize,
 			set: func(n int) {
 				t.gs.IconSize = n
@@ -240,7 +242,12 @@ func NewTracker(sel *Selection) *Tracker {
 			},
 		},
 		{
-			label: "Character size", min: MinCharSize, max: MaxCharSize, step: 10,
+			label: "Icon spacing", unit: "px", min: 0, max: MaxIconSpacing, step: 1,
+			get: func() int { return t.gs.IconSpacing },
+			set: func(n int) { t.gs.IconSpacing = n },
+		},
+		{
+			label: "Character size", unit: "px", min: MinCharSize, max: MaxCharSize, step: 10,
 			get: t.charSize,
 			set: func(n int) {
 				// The item above the character's head grows and shrinks with it.
@@ -251,10 +258,27 @@ func NewTracker(sel *Selection) *Tracker {
 			},
 		},
 		{
-			label: "Item size", min: MinItemSize, max: MaxItemSize, step: 5,
+			label: "Item size", unit: "px", min: MinItemSize, max: MaxItemSize, step: 5,
 			get: func() int { return t.gs.ItemSize },
 			set: func(n int) { t.gs.ItemSize, t.itemExact = n, float64(n) },
 		},
+	}
+	for i, ov := range t.game.Overlays {
+		t.controls = append(t.controls, &sizeControl{
+			label: "Overlay " + ov.Name, unit: "%", min: MinOverlaySize, max: MaxOverlaySize, step: 5,
+			get: func() int { return t.overlaySize(i) },
+			set: func(n int) {
+				if n == 100 {
+					delete(t.gs.OverlaySize, ov.Name)
+				} else {
+					if t.gs.OverlaySize == nil {
+						t.gs.OverlaySize = map[string]int{}
+					}
+					t.gs.OverlaySize[ov.Name] = n
+				}
+				t.scaleOverlay(i)
+			},
+		})
 	}
 	t.itemExact = float64(t.gs.ItemSize)
 	t.tracks = make([]image.Rectangle, len(t.controls))
@@ -288,15 +312,19 @@ func (t *Tracker) closePanel() {
 	t.panelOpen = false
 }
 
-// ResetLayout puts the icon, character and item sizes back to their
-// defaults and the icons back in their rows. The window then moves the
-// character and item back to CharacterOffset and ItemOffset. Like any
-// change, it is kept on Save.
+// ResetLayout puts the icon, character, item and overlay sizes and the icon
+// spacing back to their defaults, and the icons back in their rows. The
+// window then moves the character, item and overlays back to where they
+// start. Like any change, it is kept on Save.
 func (t *Tracker) ResetLayout() {
+	t.editIdx = -1
 	t.gs.IconSize, t.gs.CharSize, t.gs.ItemSize = DefaultIconSize, DefaultCharSize, DefaultItemSize
+	t.gs.IconSpacing = DefaultIconSpacing
 	t.gs.IconPos = nil
 	t.gs.OverlayPos = nil
+	t.gs.OverlaySize = nil
 	t.itemExact = DefaultItemSize
+	t.overlayScale = 0 // rescale the overlays
 	t.prepare()
 }
 
@@ -332,22 +360,43 @@ func (t *Tracker) prepare() {
 	if t.faceScale != t.scale {
 		t.face, t.faceScale = newFace(13*t.scale), t.scale
 	}
-	if t.overlayScale != t.scale {
-		t.overlayScale = t.scale
-		t.overlays = t.overlays[:0]
+	if t.overlaySrc == nil {
 		for _, ov := range t.game.Overlays {
-			// Loaded straight from disk, not cached: an overlay can be big,
-			// and only the scaled copy is needed.
 			img := loadStill(ov.Path)
 			if img == nil {
 				img = image.NewRGBA(image.Rectangle{})
-			} else if t.scale != 1 {
-				w, h := t.px(float64(img.Rect.Dx())), t.px(float64(img.Rect.Dy()))
-				img = scaleTo(img, max(w, 1), max(h, 1), xdraw.CatmullRom)
 			}
-			t.overlays = append(t.overlays, img)
+			t.overlaySrc = append(t.overlaySrc, img)
+		}
+		t.overlays = make([]*image.RGBA, len(t.overlaySrc))
+	}
+	if t.overlayScale != t.scale {
+		t.overlayScale = t.scale
+		for i := range t.overlays {
+			t.scaleOverlay(i)
 		}
 	}
+}
+
+// overlaySize is overlay i's size setting, in percent of its own size.
+func (t *Tracker) overlaySize(i int) int {
+	if n, ok := t.gs.OverlaySize[t.game.Overlays[i].Name]; ok {
+		return n
+	}
+	return 100
+}
+
+// scaleOverlay rebuilds overlay i at its size setting and the display scale.
+func (t *Tracker) scaleOverlay(i int) {
+	src := t.overlaySrc[i]
+	k := t.scale * float64(t.overlaySize(i)) / 100
+	if k == 1 || src.Rect.Empty() {
+		t.overlays[i] = src
+		return
+	}
+	w := max(int(math.Round(float64(src.Rect.Dx())*k)), 1)
+	h := max(int(math.Round(float64(src.Rect.Dy())*k)), 1)
+	t.overlays[i] = scaleTo(src, w, h, xdraw.CatmullRom)
 }
 
 // Overlays returns the game's overlays at the current scale. They don't
@@ -394,7 +443,7 @@ type trackerLayout struct {
 
 func (t *Tracker) layout() trackerLayout {
 	var l trackerLayout
-	m, gap, icon := t.px(margin), t.px(iconGap), t.iconPx
+	m, gap, icon := t.px(margin), t.px(float64(t.gs.IconSpacing)), t.iconPx
 
 	contentW := t.px(panelWidth)
 	y := m + t.px(barHeight) + t.px(barGap)
@@ -473,7 +522,7 @@ func (t *Tracker) PanelSize() image.Point {
 	pad := t.px(panelPad)
 	block := t.px(fieldH) + t.px(6) + t.px(sliderH)
 	h := pad + len(t.controls)*block + (len(t.controls)-1)*t.px(12) +
-		t.px(12) + t.px(rowH) + 2*(t.px(12)+t.px(btnH)) + pad
+		t.px(12) + t.px(rowH) + 3*(t.px(12)+t.px(btnH)) + pad
 	return image.Pt(t.px(panelWidth), h)
 }
 
@@ -639,23 +688,27 @@ func (t *Tracker) renderPanel(img *image.RGBA, panel image.Rectangle, now time.T
 	t.hits[SurfPanel] = append(t.hits[SurfPanel], hit{r: row, kind: hitOnTop})
 	y = row.Max.Y + t.px(12)
 
+	// Save on its own row, then Reset layout and Change game, then Exit.
 	half := (inner.Dx() - t.px(6)) / 2
-	save := image.Rect(inner.Min.X, y, inner.Min.X+half, y+t.px(btnH))
-	reset := image.Rect(inner.Max.X-half, y, inner.Max.X, y+t.px(btnH))
+	save := image.Rect(inner.Min.X, y, inner.Max.X, y+t.px(btnH))
 	fillRoundRect(img, save, float64(t.px(5)), colAccent)
 	drawTextCentered(img, t.face, "Save", save, colOnColor)
-	fillRoundRect(img, reset, float64(t.px(5)), colButton)
-	drawTextCentered(img, t.face, "Reset layout", reset, colFg)
-	t.hits[SurfPanel] = append(t.hits[SurfPanel], hit{r: save, kind: hitSave}, hit{r: reset, kind: hitReset})
 	y = save.Max.Y + t.px(12)
 
-	change := image.Rect(inner.Min.X, y, inner.Min.X+half, y+t.px(btnH))
-	exit := image.Rect(inner.Max.X-half, y, inner.Max.X, y+t.px(btnH))
+	reset := image.Rect(inner.Min.X, y, inner.Min.X+half, y+t.px(btnH))
+	change := image.Rect(inner.Max.X-half, y, inner.Max.X, y+t.px(btnH))
+	fillRoundRect(img, reset, float64(t.px(5)), colButton)
+	drawTextCentered(img, t.face, "Reset layout", reset, colFg)
 	fillRoundRect(img, change, float64(t.px(5)), colButton)
 	drawTextCentered(img, t.face, "Change game", change, colFg)
+	y = reset.Max.Y + t.px(12)
+
+	exit := image.Rect(inner.Min.X, y, inner.Max.X, y+t.px(btnH))
 	fillRoundRect(img, exit, float64(t.px(5)), rgb(0x8a2e2e))
 	drawTextCentered(img, t.face, "Exit", exit, colFg)
-	t.hits[SurfPanel] = append(t.hits[SurfPanel], hit{r: change, kind: hitChangeGame}, hit{r: exit, kind: hitExit})
+	t.hits[SurfPanel] = append(t.hits[SurfPanel],
+		hit{r: save, kind: hitSave}, hit{r: reset, kind: hitReset},
+		hit{r: change, kind: hitChangeGame}, hit{r: exit, kind: hitExit})
 }
 
 // renderControl draws "label [field] px" and a slider for control i starting
@@ -663,12 +716,12 @@ func (t *Tracker) renderPanel(img *image.RGBA, panel image.Rectangle, now time.T
 func (t *Tracker) renderControl(img *image.RGBA, i int, inner image.Rectangle, y int, now time.Time, wake func(time.Time)) int {
 	c := t.controls[i]
 	fh := t.px(fieldH)
-	drawText(img, t.face, c.label, inner.Min.X, y+fh/2, colFg)
-	pxW := font.MeasureString(t.face, "px").Ceil()
-	fx1 := inner.Max.X - pxW - t.px(6)
+	unitW := font.MeasureString(t.face, "px").Ceil() // the units share a column
+	fx1 := inner.Max.X - unitW - t.px(6)
 	field := image.Rect(fx1-t.px(58), y, fx1, y+fh)
+	drawText(img, t.face, fitText(t.face, c.label, field.Min.X-t.px(8)-inner.Min.X), inner.Min.X, y+fh/2, colFg)
 	t.renderField(img, i, field, now, wake)
-	drawText(img, t.face, "px", inner.Max.X-pxW, y+fh/2, colMuted)
+	drawText(img, t.face, c.unit, inner.Max.X-unitW, y+fh/2, colMuted)
 	t.hits[SurfPanel] = append(t.hits[SurfPanel], hit{r: field, kind: hitSizeField, idx: i})
 	y += fh + t.px(6)
 
@@ -785,16 +838,13 @@ func (t *Tracker) MouseDown(s Surface, p image.Point, now time.Time) Action {
 		t.closePanel()
 		return ActSave
 	case hitReset:
-		t.editIdx = -1
-		t.ResetLayout()
-		return ActReset
+		return ActConfirmReset
 	case hitChangeGame:
 		t.ChangeGame = true
 		t.closePanel()
 		return ActClose
 	case hitExit:
-		t.closePanel()
-		return ActClose
+		return ActExit
 	}
 	return ActNone
 }

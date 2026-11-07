@@ -20,6 +20,11 @@ const (
 	MinItemSize     = 32
 	MaxItemSize     = 800
 	DefaultItemSize = 150
+	MaxIconSpacing  = 64
+	// DefaultIconSpacing is the space between icons in a row.
+	DefaultIconSpacing = 10
+	MinOverlaySize     = 10 // percent of the overlay's own size
+	MaxOverlaySize     = 400
 )
 
 // Settings are the setup choices, kept in <settings folder>/settings.json.
@@ -41,6 +46,7 @@ type Settings struct {
 // settings panel.
 type GameSettings struct {
 	IconSize    int     `json:"iconSize"`
+	IconSpacing int     `json:"iconSpacing"`   // space between icons in a row
 	CharSize    int     `json:"characterSize"` // height in px
 	ItemSize    int     `json:"itemSize"`
 	AlwaysOnTop bool    `json:"alwaysOnTop"`
@@ -53,6 +59,8 @@ type GameSettings struct {
 	IconPos map[string][2]float64 `json:"iconPositions,omitempty"`
 	// Where each overlay is relative to the tracker, by file name.
 	OverlayPos map[string][2]int `json:"overlayPositions,omitempty"`
+	// Overlays shown at other than their own size, in percent, by file name.
+	OverlaySize map[string]int `json:"overlaySizes,omitempty"`
 
 	path string
 }
@@ -88,13 +96,20 @@ func (s *Settings) gamePath(game string) string { return filepath.Join(s.dir, ga
 
 // LoadGameSettings reads one game's file, with defaults if there isn't one.
 func (s *Settings) LoadGameSettings(game string) *GameSettings {
-	g := &GameSettings{IconSize: DefaultIconSize, CharSize: DefaultCharSize, ItemSize: DefaultItemSize, path: s.gamePath(game)}
+	g := &GameSettings{
+		IconSize: DefaultIconSize, IconSpacing: DefaultIconSpacing,
+		CharSize: DefaultCharSize, ItemSize: DefaultItemSize, path: s.gamePath(game),
+	}
 	if b, err := os.ReadFile(g.path); err == nil {
 		_ = json.Unmarshal(b, g)
 	}
 	g.IconSize = clampIconSize(g.IconSize)
 	g.CharSize = clampCharSize(g.CharSize)
 	g.ItemSize = clampSize(g.ItemSize, MinItemSize, MaxItemSize, DefaultItemSize)
+	g.IconSpacing = min(max(g.IconSpacing, 0), MaxIconSpacing)
+	for k, v := range g.OverlaySize {
+		g.OverlaySize[k] = clampSize(v, MinOverlaySize, MaxOverlaySize, 100)
+	}
 	return g
 }
 
