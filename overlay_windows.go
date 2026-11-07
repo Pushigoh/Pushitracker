@@ -209,9 +209,9 @@ type overlay struct {
 	t     *Tracker
 	main  layered // the tracker, character and item
 	panel layered
-	// When each of the tracker, character, item and settings panel next needs
-	// redrawing; zero when it is still until the next input.
-	due [4]time.Time
+	// When each of the tracker, character, item, settings panel and overlays
+	// next needs redrawing; zero when it is still until the next input.
+	due [5]time.Time
 
 	// Each part's latest picture, and where it is on screen; then the parts
 	// in drawing order, bottom to top.
@@ -308,7 +308,7 @@ func runTracker(t *Tracker) {
 	}
 	t.SetScale(float64(dpi) / 96)
 
-	n := numParts + len(t.Overlays())
+	n := numParts + t.NumOverlays()
 	o.parts, o.at = make([]*image.RGBA, n), make([]point, n)
 	for i := numParts; i < n; i++ {
 		o.order = append(o.order, i)
@@ -477,7 +477,7 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 			for k, i := range o.dragIcons {
 				o.t.MoveIcon(i, o.dragIconFrom[k], image.Pt(int(d.x), int(d.y)))
 			}
-			o.draw([4]bool{true})
+			o.draw([5]bool{true})
 		case partChar:
 			o.moveChar(to)
 			o.compose()
@@ -973,31 +973,34 @@ func (o *overlay) applyTopmost() {
 // render redraws everything, after input or anything else that may have
 // changed it.
 func (o *overlay) render() {
-	o.draw([4]bool{true, true, true, true})
+	o.draw([5]bool{true, true, true, true, true})
 }
 
 // renderDue redraws just what has moved on, so a character gif doesn't keep
 // redrawing the icons and the settings panel.
 func (o *overlay) renderDue() {
 	now := time.Now().Add(2 * time.Millisecond)
-	var which [4]bool
+	var which [5]bool
 	for i, at := range o.due {
 		which[i] = !at.IsZero() && !now.Before(at)
 	}
 	o.draw(which)
 }
 
-func (o *overlay) draw(which [4]bool) {
+func (o *overlay) draw(which [5]bool) {
 	now := time.Now()
 	o.followResize()
 	if which[0] {
 		img, next := o.t.Render(now)
 		o.setPart(partTracker, img)
 		o.due[0] = next
-		// The overlays only change with the scale.
-		for i, img := range o.t.Overlays() {
+	}
+	if which[4] {
+		imgs, next := o.t.RenderOverlays(now)
+		for i, img := range imgs {
 			o.setPart(numParts+i, img)
 		}
+		o.due[4] = next
 	}
 	if which[1] {
 		img, next := o.t.RenderCharacter(now)

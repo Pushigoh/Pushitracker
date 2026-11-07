@@ -105,12 +105,22 @@ type SizedAnim struct {
 	// frame has been built.
 	canvas *image.RGBA
 	next   int
+
+	// stream is set when keeping every frame would take too much memory (a
+	// big, long gif): only the frame on show is kept, and each loop is built
+	// again from the start.
+	stream bool
 }
+
+// maxFrameBytes is the most memory one file's scaled frames may take before
+// it is played without keeping them.
+const maxFrameBytes = 64 << 20
 
 func newSized(path string, src *animSource, w, h int) *SizedAnim {
 	s := &SizedAnim{path: path, src: src, w: w, h: h}
 	if src != nil {
 		s.frames = make([]*image.RGBA, len(src.delays))
+		s.stream = src.gif != nil && w*h*4*len(s.frames) > maxFrameBytes
 	}
 	return s
 }
@@ -121,10 +131,16 @@ func (s *SizedAnim) Frame(elapsed time.Duration) (*image.RGBA, time.Duration) {
 	i, d := s.src.frameIndex(elapsed)
 	if s.frames[i] == nil {
 		if s.src.gif == nil {
-			s.frames[i] = scaleTo(s.src.still, s.w, s.h, xdraw.BiLinear)
+			s.frames[i] = scaleTo(s.src.still, s.w, s.h, xdraw.CatmullRom)
 		} else {
+			if s.stream && i < s.next {
+				// Looped round: build again from the first frame.
+				clear(s.frames)
+				s.canvas, s.next = nil, 0
+			}
 			for s.next <= i {
-				s.composite()
+				// Streaming, only the frame wanted is scaled and kept.
+				s.composite(!s.stream || s.next == i)
 			}
 		}
 	}
@@ -132,8 +148,8 @@ func (s *SizedAnim) Frame(elapsed time.Duration) (*image.RGBA, time.Duration) {
 }
 
 // composite draws the next gif frame onto the canvas, honouring each frame's
-// disposal method, and keeps a scaled copy of the result.
-func (s *SizedAnim) composite() {
+// disposal method, and keeps a scaled copy of the result if keep is set.
+func (s *SizedAnim) composite(keep bool) {
 	g := s.src.gif
 	if s.canvas == nil {
 		s.canvas = image.NewRGBA(s.src.bounds)
@@ -149,7 +165,12 @@ func (s *SizedAnim) composite() {
 		copy(restore.Pix, s.canvas.Pix)
 	}
 	draw.Draw(s.canvas, frame.Bounds(), frame, frame.Bounds().Min, draw.Over)
-	s.frames[i] = scaleTo(s.canvas, s.w, s.h, xdraw.BiLinear)
+	if keep {
+		if s.stream {
+			clear(s.frames) // just the one on show
+		}
+		s.frames[i] = scaleTo(s.canvas, s.w, s.h, xdraw.BiLinear)
+	}
 
 	switch disposal {
 	case gif.DisposalBackground:
@@ -158,7 +179,7 @@ func (s *SizedAnim) composite() {
 		s.canvas = restore
 	}
 	s.next++
-	if s.next == len(g.Image) {
+	if s.next == len(g.Image) && !s.stream {
 		s.canvas = nil
 	}
 }

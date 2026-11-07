@@ -35,7 +35,7 @@ games/
     gifs/
       <n>.gif       shown when icon <n> is clicked
     overlays/
-      <name>.png    drawn behind everything else (optional)
+      <name>.png    drawn behind everything else (optional); a .gif plays
 settings/
 ```
 
