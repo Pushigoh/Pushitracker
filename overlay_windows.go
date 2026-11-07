@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"image"
 	"math"
+	"reflect"
 	"runtime"
+	"slices"
 	"sync"
 	"syscall"
 	"time"
@@ -98,6 +100,11 @@ const (
 	mkControl      = 0x0008
 	vkShift        = 0x10
 	vkControl      = 0x11
+	vkMenu         = 0x12 // Alt
+	vkZ            = 0x5A
+	wmSysCommand   = 0x0112
+	wmEnterSizeMov = 0x0231
+	scKeyMenu      = 0xF100
 	htCaption      = 2
 	htClient       = 1
 	idcArrow       = 32512
@@ -224,14 +231,19 @@ type overlay struct {
 	itemPx  int
 
 	// The character or item being dragged (-1 for none), where the cursor
-	// was when the drag started and where the part was. partTracker means an
-	// icon is being dragged: dragIcon, which started dragIconFrom away from
-	// its place in its row.
+	// was when the drag started and where the part was. partTracker means
+	// icons are being dragged (one, or a row): dragIcons, which started
+	// dragIconFrom away from their places in their rows.
 	dragPart     int
 	dragFrom     point
 	dragStart    point
-	dragIcon     int
-	dragIconFrom [2]float64
+	dragIcons    []int
+	dragIconFrom [][2]float64
+
+	// Layouts to go back to with Ctrl+Z, oldest first, and the layout from
+	// before the move under way.
+	undo   []layoutState
+	before *layoutState
 
 	// This game's settings as last saved (or loaded), to tell whether
 	// anything has changed since.
@@ -404,6 +416,17 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 		o.render()
 	case wmMove:
 		o.followMain()
+	case wmEnterSizeMov:
+		o.startMove() // the grip
+	case wmExitSizeMove:
+		o.endMove()
+	case wmSysCommand:
+		// Alt (for Alt+drag) would otherwise open the missing window menu
+		// when let go, swallowing the next key.
+		if wParam&0xfff0 == scKeyMenu {
+			return 0, true
+		}
+		return 0, false
 	case wmClose:
 		o.exit()
 	case wmDestroy:
@@ -422,16 +445,25 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 				return 0, true
 			}
 			o.dragPart, o.dragFrom, o.dragStart = q, cursorPos(), o.at[q]
-		case wParam&mkControl != 0 && p == partTracker && o.iconAt(pt) >= 0:
-			// Ctrl+drag moves one icon.
+		case (wParam&mkControl != 0 || keyDown(vkMenu)) && p == partTracker && o.iconAt(pt) >= 0:
+			// Ctrl+drag moves one icon; Alt+drag moves its whole row.
 			i := o.iconAt(pt)
-			o.dragPart, o.dragFrom, o.dragIcon, o.dragIconFrom = partTracker, cursorPos(), i, o.t.IconOffset(i)
+			o.dragIcons = []int{i}
+			if wParam&mkControl == 0 {
+				o.dragIcons = o.t.RowOf(i)
+			}
+			o.dragIconFrom = o.dragIconFrom[:0]
+			for _, j := range o.dragIcons {
+				o.dragIconFrom = append(o.dragIconFrom, o.t.IconOffset(j))
+			}
+			o.dragPart, o.dragFrom = partTracker, cursorPos()
 		case p != partTracker && p >= 0:
 			// Without Shift the character, item and overlays do nothing.
 			return 0, true
 		default:
 			return o.inputProc(SurfMain, hwnd, message, wParam, lParam)
 		}
+		o.startMove()
 		pSetCapture.Call(hwnd)
 	case wmMouseMove:
 		if o.dragPart < 0 {
@@ -442,7 +474,9 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 		to := point{o.dragStart.x + d.x, o.dragStart.y + d.y}
 		switch o.dragPart {
 		case partTracker:
-			o.t.MoveIcon(o.dragIcon, o.dragIconFrom, image.Pt(int(d.x), int(d.y)))
+			for k, i := range o.dragIcons {
+				o.t.MoveIcon(i, o.dragIconFrom[k], image.Pt(int(d.x), int(d.y)))
+			}
 			o.draw([4]bool{true})
 		case partChar:
 			o.moveChar(to)
@@ -459,6 +493,7 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 			o.measureItemOffset()
 		}
 		o.dragPart = -1
+		o.endMove()
 		if message == wmLButtonUp {
 			pReleaseCapture.Call()
 		}
@@ -569,6 +604,10 @@ func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (u
 			o.render()
 		}
 	case wmKeyDown:
+		if wParam == vkZ && keyDown(vkControl) && o.t.editIdx < 0 {
+			o.undoMove()
+			return 0, true
+		}
 		if !o.t.Key(int(wParam), now) {
 			return 0, false
 		}
@@ -762,6 +801,58 @@ func (o *overlay) followMain() {
 	if o.panelShown {
 		o.placePanel()
 	}
+}
+
+// layoutState is where everything that can be dragged is, for undo.
+type layoutState struct {
+	at      []point
+	itemOff [2]float64
+	icons   map[string][2]float64
+}
+
+func (o *overlay) layout() layoutState {
+	return layoutState{at: slices.Clone(o.at), itemOff: o.itemOff, icons: o.t.IconPositions()}
+}
+
+// startMove notes the layout before a drag, and endMove keeps it for undo if
+// the drag moved anything.
+func (o *overlay) startMove() {
+	l := o.layout()
+	o.before = &l
+}
+
+func (o *overlay) endMove() {
+	if o.before == nil {
+		return
+	}
+	b := *o.before
+	o.before = nil
+	if reflect.DeepEqual(b, o.layout()) {
+		return
+	}
+	const keep = 50
+	o.undo = append(o.undo, b)
+	if len(o.undo) > keep {
+		o.undo = slices.Delete(o.undo, 0, len(o.undo)-keep)
+	}
+}
+
+// undoMove puts back the layout from before the last drag.
+func (o *overlay) undoMove() {
+	if len(o.undo) == 0 || o.dragPart >= 0 {
+		return
+	}
+	l := o.undo[len(o.undo)-1]
+	o.undo = o.undo[:len(o.undo)-1]
+	for i, p := range l.at {
+		o.movePart(i, p)
+	}
+	o.itemOff = l.itemOff
+	o.t.SetIconPositions(l.icons)
+	if o.panelShown {
+		o.placePanel()
+	}
+	o.render()
 }
 
 // current is this game's settings as Save would write them now, with where

@@ -23,6 +23,7 @@ const (
 	MaxIconSpacing  = 64
 	// DefaultIconSpacing is the space between icons in a row.
 	DefaultIconSpacing = 10
+	MaxRowSpacing      = 64
 	MinOverlaySize     = 10 // percent of the overlay's own size
 	MaxOverlaySize     = 400
 )
@@ -47,6 +48,7 @@ type Settings struct {
 type GameSettings struct {
 	IconSize    int     `json:"iconSize"`
 	IconSpacing int     `json:"iconSpacing"`   // space between icons in a row
+	RowSpacing  int     `json:"rowSpacing"`    // space between rows
 	CharSize    int     `json:"characterSize"` // height in px
 	ItemSize    int     `json:"itemSize"`
 	AlwaysOnTop bool    `json:"alwaysOnTop"`
@@ -107,6 +109,7 @@ func (s *Settings) LoadGameSettings(game string) *GameSettings {
 	g.CharSize = clampCharSize(g.CharSize)
 	g.ItemSize = clampSize(g.ItemSize, MinItemSize, MaxItemSize, DefaultItemSize)
 	g.IconSpacing = min(max(g.IconSpacing, 0), MaxIconSpacing)
+	g.RowSpacing = min(max(g.RowSpacing, 0), MaxRowSpacing)
 	for k, v := range g.OverlaySize {
 		g.OverlaySize[k] = clampSize(v, MinOverlaySize, MaxOverlaySize, 100)
 	}
