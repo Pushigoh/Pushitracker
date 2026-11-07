@@ -172,10 +172,10 @@ type Tracker struct {
 	iconKeys []string // each icon's name in the settings file: "<row>/<icon>"
 	rowStart []int    // index into icons where each row starts
 
-	// The overlays as loaded, and at their current size. They are scaled
-	// only when the display scale or their size setting changes.
-	overlaySrc   []*image.RGBA
-	overlays     []*image.RGBA
+	// The overlays as loaded (nil if they can't be), and at their current
+	// size. A gif overlay plays from when the tracker opened.
+	overlaySrc   []*animSource
+	overlays     []*SizedAnim
 	overlayScale float64
 
 	started time.Time // when the tracker opened; the game's idle image plays from here
@@ -382,13 +382,9 @@ func (t *Tracker) prepare() {
 	}
 	if t.overlaySrc == nil {
 		for _, ov := range t.game.Overlays {
-			img := loadStill(ov.Path)
-			if img == nil {
-				img = image.NewRGBA(image.Rectangle{})
-			}
-			t.overlaySrc = append(t.overlaySrc, img)
+			t.overlaySrc = append(t.overlaySrc, loadSource(ov.Path))
 		}
-		t.overlays = make([]*image.RGBA, len(t.overlaySrc))
+		t.overlays = make([]*SizedAnim, len(t.overlaySrc))
 	}
 	if t.overlayScale != t.scale {
 		t.overlayScale = t.scale
@@ -409,19 +405,38 @@ func (t *Tracker) overlaySize(i int) int {
 // scaleOverlay rebuilds overlay i at its size setting and the display scale.
 func (t *Tracker) scaleOverlay(i int) {
 	src := t.overlaySrc[i]
-	k := t.scale * float64(t.overlaySize(i)) / 100
-	if k == 1 || src.Rect.Empty() {
-		t.overlays[i] = src
+	if src == nil || src.bounds.Empty() {
+		t.overlays[i] = nil
 		return
 	}
-	w := max(int(math.Round(float64(src.Rect.Dx())*k)), 1)
-	h := max(int(math.Round(float64(src.Rect.Dy())*k)), 1)
-	t.overlays[i] = scaleTo(src, w, h, xdraw.CatmullRom)
+	k := t.scale * float64(t.overlaySize(i)) / 100
+	w := max(int(math.Round(float64(src.bounds.Dx())*k)), 1)
+	h := max(int(math.Round(float64(src.bounds.Dy())*k)), 1)
+	t.overlays[i] = newSized(t.game.Overlays[i].Path, src, w, h)
 }
 
-// Overlays returns the game's overlays at the current scale. They don't
-// change, so the window draws them once.
-func (t *Tracker) Overlays() []*image.RGBA { return t.overlays }
+// NumOverlays is how many overlays the game has.
+func (t *Tracker) NumOverlays() int { return len(t.game.Overlays) }
+
+// RenderOverlays returns each overlay's picture now, and when one next
+// changes (zero if none is animated). The pictures may be cached frames, so
+// they must not be changed.
+func (t *Tracker) RenderOverlays(now time.Time) ([]*image.RGBA, time.Time) {
+	imgs := make([]*image.RGBA, len(t.overlays))
+	var next time.Time
+	for i, a := range t.overlays {
+		if a == nil {
+			imgs[i] = image.NewRGBA(image.Rectangle{})
+			continue
+		}
+		var d time.Duration
+		imgs[i], d = a.Frame(now.Sub(t.started))
+		if at := now.Add(d); d > 0 && (next.IsZero() || at.Before(next)) {
+			next = at
+		}
+	}
+	return imgs, next
+}
 
 // OverlayOffsets are where the overlays start relative to the tracker's
 // top-left corner, until they are dragged: one under another, starting where
@@ -429,9 +444,11 @@ func (t *Tracker) Overlays() []*image.RGBA { return t.overlays }
 func (t *Tracker) OverlayOffsets() []image.Point {
 	offs := make([]image.Point, len(t.overlays))
 	y := t.px(margin) + t.px(barHeight) + t.px(barGap)
-	for i, img := range t.overlays {
+	for i, a := range t.overlays {
 		offs[i] = image.Pt(t.px(margin), y)
-		y += img.Rect.Dy()
+		if a != nil {
+			y += a.h
+		}
 	}
 	return offs
 }
