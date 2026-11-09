@@ -217,7 +217,7 @@ func (c *configWindow) hasChoice(list []*choice, name string) bool {
 }
 
 // canStart reports whether there is a game to track. A character is
-// optional: without one the tracker shows just the icons and item.
+// optional: without one the tracker shows just the icons, item and overlays.
 func (c *configWindow) canStart() bool {
 	return c.game != nil
 }
@@ -387,9 +387,21 @@ func (c *configWindow) layout(gtx layout.Context) layout.Dimensions {
 	}
 	gameStatus := "Pick a game"
 	if c.game != nil {
-		gameStatus = fmt.Sprintf("%s: %d rows, %d icons, icon size %d px", strings.ToUpper(c.game.Name), len(c.game.Rows), c.game.IconCount(), c.gameIcon)
-		if !isDir(c.game.GifsDir) {
-			gameStatus += " (no gifs folder)"
+		if n := c.game.IconCount(); n > 0 {
+			gameStatus = fmt.Sprintf("%s: %d rows, %d icons, icon size %d px", strings.ToUpper(c.game.Name), len(c.game.Rows), n, c.gameIcon)
+			if !isDir(c.game.GifsDir) {
+				gameStatus += " (no gifs folder)"
+			}
+		} else {
+			gameStatus = strings.ToUpper(c.game.Name) + ": no icons, "
+			switch n := len(c.game.Overlays); n {
+			case 0:
+				gameStatus += "no overlays"
+			case 1:
+				gameStatus += "1 overlay"
+			default:
+				gameStatus += fmt.Sprintf("%d overlays", n)
+			}
 		}
 	}
 
