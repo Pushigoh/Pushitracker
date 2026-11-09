@@ -194,6 +194,7 @@ func (c *sizeControl) clamp(n int) int { return min(max(n, c.min), c.max) }
 type Tracker struct {
 	game     *Game
 	charDir  string
+	gameDir  string // the character's images for this game ("" if none)
 	settings *Settings
 	gs       *GameSettings // this game's sizes, always-on-top and positions
 	cache    *AnimCache
@@ -402,6 +403,7 @@ func NewTracker(sel *Selection) *Tracker {
 	t.started = time.Now()
 	t.charPath, t.charStart = characterImage(t.charDir, idleName), t.started
 	t.talkPath = characterImage(t.charDir, talkName)
+	t.gameDir = gameCharDir(t.charDir, t.game.Name)
 	return t
 }
 
@@ -1311,19 +1313,30 @@ func (t *Tracker) MouseUp(surf Surface, p image.Point, now time.Time) {
 	id := s.def.Stages[s.shownStage()].ID
 	delay := time.Duration(t.gs.ItemDelayMs) * time.Millisecond
 	t.nextItem, t.nextItemAt = t.gifFile(id), now.Add(delay)
-	// The character reacts with its <id> image if it has one, otherwise its
-	// reward image, each with an optional _talk version for while talking.
-	base := id
-	t.charPath, t.charStart = characterImage(t.charDir, id), now
-	if t.charPath == "" {
-		base = rewardName
-		t.charPath = characterImage(t.charDir, rewardName)
-	}
-	t.charTalk = characterImage(t.charDir, base+talkSuffix)
+	t.charPath, t.charTalk = t.rewardImages(id)
+	t.charStart = now
 	// One shared deadline, the reward time after the item appears: a new
 	// click restarts it.
 	t.resetAt = t.nextItemAt.Add(time.Duration(t.gs.RewardSeconds) * time.Second)
 	t.tick(now) // with no delay, the item shows now
+}
+
+// rewardImages picks the character's reaction to icon stage id, and its
+// _talk version for while talking ("" if none). The first image there is
+// wins: this game's <id>, the shared <id>, this game's reward, the shared
+// reward. The talk version is looked for next to it.
+func (t *Tracker) rewardImages(id string) (path, talk string) {
+	for _, try := range []struct{ dir, name string }{
+		{t.gameDir, id}, {t.charDir, id}, {t.gameDir, rewardName}, {t.charDir, rewardName},
+	} {
+		if try.dir == "" {
+			continue
+		}
+		if p := characterImage(try.dir, try.name); p != "" {
+			return p, characterImage(try.dir, try.name+talkSuffix)
+		}
+	}
+	return "", ""
 }
 
 // RightClick turns the icon at p back to grey (not collected), without

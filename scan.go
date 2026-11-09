@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -166,12 +167,28 @@ func characterImage(dir, name string) string {
 	return ""
 }
 
+// gameCharDir returns the character's folder of images for one game (named
+// like the game's folder, in any case), or "" if it has none.
+func gameCharDir(charDir, game string) string {
+	if charDir == "" {
+		return ""
+	}
+	entries, _ := os.ReadDir(charDir)
+	for _, e := range entries {
+		if e.IsDir() && strings.EqualFold(e.Name(), game) {
+			return filepath.Join(charDir, e.Name())
+		}
+	}
+	return ""
+}
+
 // thisFolder names a characters folder that holds one character's images
 // directly instead of a folder per character.
 const thisFolder = "."
 
 // ListCharacters returns the character folders in the characters folder. If
-// it has no subfolders but does have images, it is itself the one character.
+// it has an idle image itself (its subfolders then being per-game images),
+// or images and no subfolders, it is itself the one character.
 func ListCharacters(charsDir string) ([]string, error) {
 	if charsDir == "" {
 		return nil, fmt.Errorf("no characters folder selected")
@@ -180,7 +197,7 @@ func ListCharacters(charsDir string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(chars) == 0 && countCharImages(charsDir) > 0 {
+	if characterImage(charsDir, idleName) != "" || len(chars) == 0 && countCharImages(charsDir) > 0 {
 		chars = []string{thisFolder}
 	}
 	if len(chars) == 0 {
@@ -280,9 +297,18 @@ func fileExists(p string) bool {
 	return err == nil && !fi.IsDir()
 }
 
-// natLess orders strings naturally: runs of digits compare numerically, so
-// "2" < "10".
+// natLess orders strings naturally and ignoring case: runs of digits
+// compare numerically, so "2" < "10", and "bow" < "Hookshot" < "zora". Names
+// that differ only in case still get a fixed order.
 func natLess(a, b string) bool {
+	if c := natCompare(strings.ToLower(a), strings.ToLower(b)); c != 0 {
+		return c < 0
+	}
+	return natCompare(a, b) < 0
+}
+
+// natCompare is natLess's comparison, case and all: -1, 0 or 1.
+func natCompare(a, b string) int {
 	for a != "" && b != "" {
 		ca, ra := natChunk(a)
 		cb, rb := natChunk(b)
@@ -291,18 +317,18 @@ func natLess(a, b string) bool {
 			if da && db {
 				na, nb := strings.TrimLeft(ca, "0"), strings.TrimLeft(cb, "0")
 				if len(na) != len(nb) {
-					return len(na) < len(nb)
+					return cmp.Compare(len(na), len(nb))
 				}
 				if na != nb {
-					return na < nb
+					return strings.Compare(na, nb)
 				}
 			} else {
-				return ca < cb
+				return strings.Compare(ca, cb)
 			}
 		}
 		a, b = ra, rb
 	}
-	return len(a) < len(b)
+	return cmp.Compare(len(a), len(b))
 }
 
 func natChunk(s string) (chunk, rest string) {
