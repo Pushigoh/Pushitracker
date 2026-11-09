@@ -16,7 +16,7 @@ import (
 // Game is one folder under the games folder (e.g. "oot", "mm", "tp"). Each
 // game has its own icons and gifs; nothing is shared between games.
 //
-//	games/<game>/icons/<row>/<n>.png   icons, one row per folder
+//	games/<game>/icons/<row>/<n>.png   icons, one row per folder (optional)
 //	games/<game>/icons/0.png           idle item-display image (optional)
 //	games/<game>/gifs/<n>.gif          item animation on click
 //	games/<game>/overlays/<name>.png   images behind everything (optional)
@@ -86,28 +86,24 @@ var stageName = regexp.MustCompile(`^(.+)-(\d+)$`)
 
 var iconExts = map[string]bool{".png": true, ".gif": true, ".jpg": true, ".jpeg": true}
 
-// ListGames returns the folders in the games folder that have an icons
-// folder; anything else there is ignored.
+// ListGames returns the folders in the games folder. Every folder is a game,
+// even one with only overlays and no icons.
 func ListGames(gamesDir string) ([]string, error) {
 	if gamesDir == "" {
 		return nil, fmt.Errorf("no games folder selected")
 	}
-	dirs, err := subdirs(gamesDir)
+	games, err := subdirs(gamesDir)
 	if err != nil {
 		return nil, err
 	}
-	var games []string
-	for _, d := range dirs {
-		if isDir(filepath.Join(gamesDir, d, iconsFolder)) {
-			games = append(games, d)
-		}
-	}
 	if len(games) == 0 {
-		return nil, fmt.Errorf("no game folders with an %s folder in %s", iconsFolder, gamesDir)
+		return nil, fmt.Errorf("no game folders in %s", gamesDir)
 	}
 	return games, nil
 }
 
+// LoadGame reads a game's folder. Its icons folder is optional: without one,
+// or without row folders in it, the game has no icons.
 func LoadGame(gamesDir, name string) (*Game, error) {
 	dir := filepath.Join(gamesDir, name)
 	icons := filepath.Join(dir, iconsFolder)
@@ -116,19 +112,20 @@ func LoadGame(gamesDir, name string) (*Game, error) {
 		g.IdlePath = p
 	}
 
-	rowNames, err := subdirs(icons)
-	if err != nil {
-		return nil, err
-	}
-	for _, r := range rowNames {
-		row, err := scanRow(filepath.Join(icons, r))
+	if isDir(icons) {
+		rowNames, err := subdirs(icons)
 		if err != nil {
 			return nil, err
 		}
-		g.Rows = append(g.Rows, Row{Name: r, Icons: row})
-	}
-	if len(g.Rows) == 0 {
-		return nil, fmt.Errorf("%s has no row folders", icons)
+		for _, r := range rowNames {
+			row, err := scanRow(filepath.Join(icons, r))
+			if err != nil {
+				return nil, err
+			}
+			g.Rows = append(g.Rows, Row{Name: r, Icons: row})
+		}
+	} else if !isDir(dir) {
+		return nil, fmt.Errorf("no game folder %s", dir)
 	}
 	g.Overlays = scanOverlays(filepath.Join(dir, overlaysFolder), g.Rows)
 	return g, nil

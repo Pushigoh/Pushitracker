@@ -30,8 +30,8 @@ characters/
     reward_talk.gif, <n>_talk.gif   the same while talking during a reward (optional)
     <game>/         reward and <n> images for one game only, named like its games/ folder (optional)
 games/
-  <game>/
-    icons/
+  <game>/           every folder here is a game, even one with only overlays
+    icons/          optional
       0.png         item display when nothing is clicked (optional)
       <row>/<n>.png               one icon; each folder is one row; a .gif plays
       <row>/<n>-1.png, <n>-2.png  an icon with several stages
