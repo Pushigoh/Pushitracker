@@ -142,6 +142,10 @@ func (g *Game) IconCount() int {
 const (
 	idleName   = "idle"   // shown at rest
 	rewardName = "reward" // shown on a click when there is no <id> image
+	// talk is shown instead of idle while the mic is loud enough, and
+	// <name>_talk instead of a reward image <name>, if there is one.
+	talkName   = "talk"
+	talkSuffix = "_talk"
 )
 
 // charExts are the kinds of character image, in the order they are looked

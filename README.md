@@ -26,6 +26,8 @@ characters/
     idle.gif        shown at rest
     reward.gif      shown when an icon is clicked
     <n>.gif         shown instead of reward.gif for icon <n> (optional)
+    talk.gif        shown instead of idle while you talk (optional)
+    reward_talk.gif, <n>_talk.gif   the same while talking during a reward (optional)
 games/
   <game>/
     icons/
@@ -47,4 +49,8 @@ settings/
 - Ctrl+drag an icon to move just that icon, or Alt+drag it to move its whole row.
 - Ctrl+Z undoes the last move.
 - The gear opens the settings. Save keeps sizes and positions for this game.
+
+## Talking character
+
+Choose a microphone in setup or in the settings panel, where a bar shows how loud it is. When it gets louder than the Open threshold (the white line on the bar), a character with a talk image shows it instead of idle. It keeps talking until the mic has been quieter than the Close threshold (the grey line) for the Talk hold time.
 
