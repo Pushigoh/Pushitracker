@@ -28,10 +28,31 @@ type Game struct {
 	Overlays []Overlay
 }
 
-// Overlay is an image drawn behind the icons, character and item.
+// Overlay is an image drawn behind the icons, character and item. Images
+// named like an icon's stages ("16-1", "16-2", or "22" for a plain icon) are
+// one overlay linked to that icon: it shows the image for the stage the icon
+// is on, and nothing on a stage without one. While the icon isn't collected
+// it shows its "<icon>-0" image, or if there is none, the first stage's in
+// grey.
 type Overlay struct {
-	Name string // file name without extension, which its position is saved under
-	Path string
+	Name string // what its position and size are saved under: the file or icon name
+	Path string // an overlay that is always shown ("" if linked)
+
+	Icon   string   // the linked icon, "<row>/<icon>" ("" if none)
+	Stages []string // the image for each of the icon's stages ("" for none)
+	Off    string   // the image for while it isn't collected ("" for none)
+}
+
+// Images are all of the overlay's images, the first being the one it is
+// laid out by.
+func (ov *Overlay) Images() []string {
+	var paths []string
+	for _, p := range append([]string{ov.Path}, append(ov.Stages, ov.Off)...) {
+		if p != "" {
+			paths = append(paths, p)
+		}
+	}
+	return paths
 }
 
 // Row is one subfolder of a game; every icon in it is drawn on one line.
@@ -109,13 +130,15 @@ func LoadGame(gamesDir, name string) (*Game, error) {
 	if len(g.Rows) == 0 {
 		return nil, fmt.Errorf("%s has no row folders", icons)
 	}
-	g.Overlays = scanOverlays(filepath.Join(dir, overlaysFolder))
+	g.Overlays = scanOverlays(filepath.Join(dir, overlaysFolder), g.Rows)
 	return g, nil
 }
 
 // scanOverlays lists the images in a game's overlays folder, which is
-// optional.
-func scanOverlays(dir string) []Overlay {
+// optional, linking those named like an icon's stages to the icon. Names
+// match ignoring case; an image named like stages of two icons goes with the
+// first.
+func scanOverlays(dir string, rows []Row) []Overlay {
 	entries, _ := os.ReadDir(dir)
 	var names []string
 	for _, e := range entries {
@@ -124,10 +147,50 @@ func scanOverlays(dir string) []Overlay {
 		}
 	}
 	sort.Slice(names, func(i, j int) bool { return natLess(names[i], names[j]) })
-	var overlays []Overlay
+	// Each image by name; the first of a name wins (16-1.gif over 16-1.png).
+	byID := map[string]string{}
 	for _, n := range names {
-		overlays = append(overlays, Overlay{Name: strings.TrimSuffix(n, filepath.Ext(n)), Path: filepath.Join(dir, n)})
+		id := strings.ToLower(strings.TrimSuffix(n, filepath.Ext(n)))
+		if _, ok := byID[id]; !ok {
+			byID[id] = filepath.Join(dir, n)
+		}
 	}
+	take := func(id string) string {
+		id = strings.ToLower(id)
+		p := byID[id]
+		delete(byID, id)
+		return p
+	}
+
+	var overlays []Overlay
+	for _, r := range rows {
+		for _, def := range r.Icons {
+			ov := Overlay{Name: def.Key, Icon: r.Name + "/" + def.Key, Stages: make([]string, len(def.Stages))}
+			for k, st := range def.Stages {
+				ov.Stages[k] = take(st.ID)
+			}
+			ov.Off = take(def.Key + "-0")
+			if len(ov.Images()) > 0 {
+				overlays = append(overlays, ov)
+			}
+		}
+	}
+	for _, n := range names {
+		id := strings.TrimSuffix(n, filepath.Ext(n))
+		if p := byID[strings.ToLower(id)]; p == filepath.Join(dir, n) {
+			overlays = append(overlays, Overlay{Name: id, Path: p})
+		}
+	}
+	// Two icons of the same name in different rows: the later ones' overlays
+	// are saved under the full name, so each keeps its own place.
+	seen := map[string]bool{}
+	for i := range overlays {
+		if ov := &overlays[i]; ov.Icon != "" && seen[strings.ToLower(ov.Name)] {
+			ov.Name = ov.Icon
+		}
+		seen[strings.ToLower(overlays[i].Name)] = true
+	}
+	sort.SliceStable(overlays, func(i, j int) bool { return natLess(overlays[i].Name, overlays[j].Name) })
 	return overlays
 }
 

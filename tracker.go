@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	xdraw "golang.org/x/image/draw"
 	"golang.org/x/image/font"
 )
 
@@ -119,10 +118,13 @@ const (
 )
 
 type iconState struct {
-	def    IconDef
-	stage  int // -1 = not collected (grayscale first stage)
-	colors []*image.RGBA
-	grays  []*image.RGBA
+	def   IconDef
+	stage int // -1 = not collected (grayscale first stage)
+	// Each stage's image as loaded, and at the icon size in colour and in
+	// grey. A gif plays from when the tracker opened.
+	srcs   []*animSource
+	colors []*SizedAnim
+	grays  []*SizedAnim
 
 	fadeFrom  float64
 	fadeStart time.Time
@@ -205,10 +207,13 @@ type Tracker struct {
 	iconKeys []string // each icon's name in the settings file: "<row>/<icon>"
 	rowStart []int    // index into icons where each row starts
 
-	// The overlays as loaded (nil if they can't be), and at their current
-	// size. A gif overlay plays from when the tracker opened.
-	overlaySrc   []*animSource
-	overlays     []*SizedAnim
+	// The overlays' images as loaded, by path, and each overlay's images at
+	// its current size, built as they are shown. A gif overlay plays from
+	// when the tracker opened. overlayIcon is the icon each is linked to (-1
+	// for none).
+	overlaySrc   map[string]*animSource
+	overlaySized []map[overlayImage]*SizedAnim
+	overlayIcon  []int
 	overlayScale float64
 
 	started time.Time // when the tracker opened; the game's idle image plays from here
@@ -300,6 +305,9 @@ func NewTracker(sel *Selection) *Tracker {
 		}
 	}
 	t.rowStart = append(t.rowStart, len(t.icons))
+	for _, ov := range t.game.Overlays {
+		t.overlayIcon = append(t.overlayIcon, slices.Index(t.iconKeys, ov.Icon))
+	}
 
 	t.controls = []*sizeControl{
 		{
@@ -530,17 +538,20 @@ func (t *Tracker) prepare() {
 		t.iconPx = size
 		for _, s := range t.icons {
 			s.colors, s.grays = nil, nil
-			for _, st := range s.def.Stages {
-				var c *image.RGBA
-				// Scaled straight from the full-size image: the slider passes
-				// through many sizes and caching each one would pile up memory.
-				if img := t.cache.Icon(st.Path); img != nil {
-					c = scaleTo(img, size, size, xdraw.CatmullRom)
-				} else {
-					c = image.NewRGBA(image.Rect(0, 0, size, size))
+			for k, st := range s.def.Stages {
+				if len(s.srcs) <= k {
+					src := loadSource(st.Path)
+					if src == nil {
+						src = blankSource()
+					}
+					s.srcs = append(s.srcs, src)
 				}
-				s.colors = append(s.colors, c)
-				s.grays = append(s.grays, grayscale(c))
+				// Frames are scaled as they are shown, straight from the
+				// full-size image: the slider passes through many sizes.
+				s.colors = append(s.colors, newSized(st.Path, s.srcs[k], size, size))
+				g := newSized(st.Path, s.srcs[k], size, size)
+				g.gray = true
+				s.grays = append(s.grays, g)
 			}
 		}
 	}
@@ -548,17 +559,21 @@ func (t *Tracker) prepare() {
 		t.face, t.faceScale = newFace(13*t.scale), t.scale
 	}
 	if t.overlaySrc == nil {
-		for _, ov := range t.game.Overlays {
-			t.overlaySrc = append(t.overlaySrc, loadSource(ov.Path))
-		}
-		t.overlays = make([]*SizedAnim, len(t.overlaySrc))
+		t.overlaySrc = map[string]*animSource{}
+		t.overlaySized = make([]map[overlayImage]*SizedAnim, len(t.game.Overlays))
 	}
 	if t.overlayScale != t.scale {
 		t.overlayScale = t.scale
-		for i := range t.overlays {
+		for i := range t.overlaySized {
 			t.scaleOverlay(i)
 		}
 	}
+}
+
+// overlayImage is one of an overlay's images, in colour or in grey.
+type overlayImage struct {
+	path string
+	gray bool
 }
 
 // overlaySize is overlay i's size setting, in percent of its own size.
@@ -569,17 +584,50 @@ func (t *Tracker) overlaySize(i int) int {
 	return 100
 }
 
-// scaleOverlay rebuilds overlay i at its size setting and the display scale.
+// scaleOverlay has overlay i's images rebuilt at its size setting and the
+// display scale.
 func (t *Tracker) scaleOverlay(i int) {
-	src := t.overlaySrc[i]
-	if src == nil || src.bounds.Empty() {
-		t.overlays[i] = nil
-		return
+	t.overlaySized[i] = map[overlayImage]*SizedAnim{}
+}
+
+// overlayAnim is one of overlay i's images at its current size, or nil if
+// it can't be loaded.
+func (t *Tracker) overlayAnim(i int, img overlayImage) *SizedAnim {
+	if a, ok := t.overlaySized[i][img]; ok {
+		return a
 	}
-	k := t.scale * float64(t.overlaySize(i)) / 100
-	w := max(int(math.Round(float64(src.bounds.Dx())*k)), 1)
-	h := max(int(math.Round(float64(src.bounds.Dy())*k)), 1)
-	t.overlays[i] = newSized(t.game.Overlays[i].Path, src, w, h)
+	src, ok := t.overlaySrc[img.path]
+	if !ok {
+		src = loadSource(img.path)
+		t.overlaySrc[img.path] = src
+	}
+	var a *SizedAnim
+	if src != nil && !src.bounds.Empty() {
+		k := t.scale * float64(t.overlaySize(i)) / 100
+		w := max(int(math.Round(float64(src.bounds.Dx())*k)), 1)
+		h := max(int(math.Round(float64(src.bounds.Dy())*k)), 1)
+		a = newSized(img.path, src, w, h)
+		a.gray = img.gray
+	}
+	t.overlaySized[i][img] = a
+	return a
+}
+
+// overlayShown is the image overlay i shows now (path "" for none). A linked
+// one shows its icon's stage, or while the icon isn't collected, its off
+// image, or else the first stage's in grey.
+func (t *Tracker) overlayShown(i int) overlayImage {
+	ov := &t.game.Overlays[i]
+	if t.overlayIcon[i] < 0 {
+		return overlayImage{path: ov.Path}
+	}
+	switch s := t.icons[t.overlayIcon[i]]; {
+	case s.stage >= 0:
+		return overlayImage{path: ov.Stages[s.stage]}
+	case ov.Off != "":
+		return overlayImage{path: ov.Off}
+	}
+	return overlayImage{path: ov.Stages[0], gray: true}
 }
 
 // NumOverlays is how many overlays the game has.
@@ -589,9 +637,13 @@ func (t *Tracker) NumOverlays() int { return len(t.game.Overlays) }
 // changes (zero if none is animated). The pictures may be cached frames, so
 // they must not be changed.
 func (t *Tracker) RenderOverlays(now time.Time) ([]*image.RGBA, time.Time) {
-	imgs := make([]*image.RGBA, len(t.overlays))
+	imgs := make([]*image.RGBA, len(t.game.Overlays))
 	var next time.Time
-	for i, a := range t.overlays {
+	for i := range imgs {
+		var a *SizedAnim
+		if img := t.overlayShown(i); img.path != "" {
+			a = t.overlayAnim(i, img)
+		}
 		if a == nil {
 			imgs[i] = image.NewRGBA(image.Rectangle{})
 			continue
@@ -607,13 +659,13 @@ func (t *Tracker) RenderOverlays(now time.Time) ([]*image.RGBA, time.Time) {
 
 // OverlayOffsets are where the overlays start relative to the tracker's
 // top-left corner, until they are dragged: one under another, starting where
-// the icons do.
+// the icons do, each taking the height of its first image.
 func (t *Tracker) OverlayOffsets() []image.Point {
-	offs := make([]image.Point, len(t.overlays))
+	offs := make([]image.Point, len(t.game.Overlays))
 	y := t.px(margin) + t.px(barHeight) + t.px(barGap)
-	for i, a := range t.overlays {
+	for i, ov := range t.game.Overlays {
 		offs[i] = image.Pt(t.px(margin), y)
-		if a != nil {
+		if a := t.overlayAnim(i, overlayImage{path: ov.Images()[0]}); a != nil {
 			y += a.h
 		}
 	}
@@ -868,10 +920,20 @@ func (t *Tracker) Render(now time.Time) (*image.RGBA, time.Time) {
 		if fading {
 			wake(now.Add(16 * time.Millisecond))
 		}
-		if amount < 1 {
-			drawImage(img, r.Min, s.grays[k], 1)
+		// A gif icon plays from when the tracker opened.
+		frame := func(a *SizedAnim) *image.RGBA {
+			f, d := a.Frame(now.Sub(t.started))
+			if d > 0 {
+				wake(now.Add(d))
+			}
+			return f
 		}
-		drawImage(img, r.Min, s.colors[k], amount)
+		if amount < 1 {
+			drawImage(img, r.Min, frame(s.grays[k]), 1)
+		}
+		if amount > 0 {
+			drawImage(img, r.Min, frame(s.colors[k]), amount)
+		}
 		t.hits[SurfMain] = append(t.hits[SurfMain], hit{r: r, kind: hitIcon, idx: i})
 	}
 
