@@ -6,6 +6,7 @@ import (
 	"maps"
 	"math"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -27,8 +28,8 @@ const (
 	sliderH     = 24
 	rowH        = 24
 	btnH        = 28
-	sectionH    = 24 // a settings section's heading
-	sectionGap  = 12 // extra space above a section after the first, with a line in it
+	tabH        = 28 // the settings panel's tab row
+	sectionGap  = 12 // space above the panel's buttons, with a line in it
 	fadeTime    = 300 * time.Millisecond
 	caretBlink  = 530 * time.Millisecond
 	minAlphaHit = 1 // nearly invisible, but keeps icon gaps clickable
@@ -73,6 +74,7 @@ const (
 	hitChangeGame
 	hitExit
 	hitMic
+	hitTab
 )
 
 type hit struct {
@@ -163,9 +165,22 @@ func (s *iconState) clear(now time.Time) {
 
 func (s *iconState) shownStage() int { return max(s.stage, 0) }
 
+// The settings panel's tabs, in order, and what each tab says.
+const (
+	charSection    = "Character & item"
+	iconSection    = "Icons"
+	overlaySection = "Overlays"
+	micSection     = "Microphone"
+)
+
+var (
+	sectionOrder = []string{charSection, iconSection, overlaySection, micSection}
+	tabLabels    = map[string]string{charSection: "Character", micSection: "Mic"}
+)
+
 // sizeControl is one "label [field] px" + slider block in the settings panel.
 type sizeControl struct {
-	section  string // the heading it sits under
+	section  string // the tab it is on
 	label    string
 	unit     string
 	min, max int
@@ -242,6 +257,7 @@ type Tracker struct {
 	faceScale float64
 
 	controls []*sizeControl
+	tab      string // the settings panel's tab on show
 	// The item size before rounding, so it keeps its proportion to the
 	// character however often the character is resized.
 	itemExact float64
@@ -286,7 +302,7 @@ func NewTracker(sel *Selection) *Tracker {
 
 	t.controls = []*sizeControl{
 		{
-			section: "Icons", label: "Icon size", unit: "px", min: MinIconSize, max: MaxIconSize, step: 1,
+			section: iconSection, label: "Icon size", unit: "px", min: MinIconSize, max: MaxIconSize, step: 1,
 			get: t.iconSize,
 			set: func(n int) {
 				t.gs.IconSize = n
@@ -294,17 +310,17 @@ func NewTracker(sel *Selection) *Tracker {
 			},
 		},
 		{
-			section: "Icons", label: "Icon spacing", unit: "px", min: 0, max: MaxIconSpacing, step: 1,
+			section: iconSection, label: "Icon spacing", unit: "px", min: 0, max: MaxIconSpacing, step: 1,
 			get: func() int { return t.gs.IconSpacing },
 			set: func(n int) { t.gs.IconSpacing = n },
 		},
 		{
-			section: "Icons", label: "Row spacing", unit: "px", min: 0, max: MaxRowSpacing, step: 1,
+			section: iconSection, label: "Row spacing", unit: "px", min: 0, max: MaxRowSpacing, step: 1,
 			get: func() int { return t.gs.RowSpacing },
 			set: func(n int) { t.gs.RowSpacing = n },
 		},
 		{
-			section: "Character & item", label: "Character size", unit: "px", min: MinCharSize, max: MaxCharSize, step: 10,
+			section: charSection, label: "Character size", unit: "px", min: MinCharSize, max: MaxCharSize, step: 10,
 			get: t.charSize,
 			set: func(n int) {
 				// The item above the character's head grows and shrinks with it.
@@ -315,17 +331,17 @@ func NewTracker(sel *Selection) *Tracker {
 			},
 		},
 		{
-			section: "Character & item", label: "Reward time", unit: "s", min: MinRewardSeconds, max: MaxRewardSeconds, step: 1,
+			section: charSection, label: "Reward time", unit: "s", min: MinRewardSeconds, max: MaxRewardSeconds, step: 1,
 			get: func() int { return t.gs.RewardSeconds },
 			set: func(n int) { t.gs.RewardSeconds = n },
 		},
 		{
-			section: "Character & item", label: "Item delay", unit: "ms", min: 0, max: MaxItemDelayMs, step: 100,
+			section: charSection, label: "Item delay", unit: "ms", min: 0, max: MaxItemDelayMs, step: 100,
 			get: func() int { return t.gs.ItemDelayMs },
 			set: func(n int) { t.gs.ItemDelayMs = n },
 		},
 		{
-			section: "Character & item", label: "Item size", unit: "px", min: MinItemSize, max: MaxItemSize, step: 5,
+			section: charSection, label: "Item size", unit: "px", min: MinItemSize, max: MaxItemSize, step: 5,
 			get: func() int { return t.gs.ItemSize },
 			set: func(n int) { t.gs.ItemSize, t.itemExact = n, float64(n) },
 		},
@@ -360,7 +376,7 @@ func NewTracker(sel *Selection) *Tracker {
 	t.micLevel.Store(math.Float64bits(micSilence))
 	for i, ov := range t.game.Overlays {
 		t.controls = append(t.controls, &sizeControl{
-			section: "Overlays", label: ov.Name, unit: "%", min: MinOverlaySize, max: MaxOverlaySize, step: 5,
+			section: overlaySection, label: ov.Name, unit: "%", min: MinOverlaySize, max: MaxOverlaySize, step: 5,
 			get: func() int { return t.overlaySize(i) },
 			set: func(n int) {
 				if n == 100 {
@@ -375,6 +391,11 @@ func NewTracker(sel *Selection) *Tracker {
 			},
 		})
 	}
+	// Grouped by tab, in tab order.
+	slices.SortStableFunc(t.controls, func(a, b *sizeControl) int {
+		return slices.Index(sectionOrder, a.section) - slices.Index(sectionOrder, b.section)
+	})
+	t.tab = t.tabs()[0]
 	t.itemExact = float64(t.gs.ItemSize)
 	t.tracks = make([]image.Rectangle, len(t.controls))
 
@@ -383,9 +404,6 @@ func NewTracker(sel *Selection) *Tracker {
 	t.talkPath = characterImage(t.charDir, talkName)
 	return t
 }
-
-// micSection is the settings panel's microphone section.
-const micSection = "Microphone"
 
 // talkGate decides when the character is talking: from the moment the level
 // reaches the open threshold until it has stayed under the close threshold
@@ -726,34 +744,53 @@ func (t *Tracker) MoveIcon(i int, from [2]float64, d image.Point) {
 
 func (t *Tracker) Size() image.Point { return t.layout().size }
 
-// PanelSize is the settings panel window's size in pixels.
+// PanelSize is the settings panel window's size in pixels. It is as tall as
+// the tallest tab, so it keeps its size and its buttons stay put whichever
+// tab is shown.
 func (t *Tracker) PanelSize() image.Point {
-	pad := t.px(panelPad)
-	block := t.px(fieldH) + t.px(6) + t.px(sliderH)
-	h := pad + len(t.controls)*block + (len(t.controls)-1)*t.px(12) + t.micRowH() +
-		t.px(12) + t.px(rowH) + 3*(t.px(12)+t.px(btnH)) + pad
-	for i := range t.controls {
-		h += t.headingSpace(i)
+	content := 0
+	for _, tab := range t.tabs() {
+		content = max(content, t.tabHeight(tab))
 	}
+	h := t.panelTop() + content + t.px(sectionGap) +
+		t.px(rowH) + 3*(t.px(12)+t.px(btnH)) + t.px(panelPad)
 	return image.Pt(t.px(panelWidth), h)
+}
+
+// panelTop is where the tab's settings start: under the tab row.
+func (t *Tracker) panelTop() int { return t.px(panelPad) + t.px(tabH) + t.px(12) }
+
+// tabs are the settings panel's tabs, in order: the sections that have
+// settings in them.
+func (t *Tracker) tabs() []string {
+	var tabs []string
+	for _, c := range t.controls {
+		if !slices.Contains(tabs, c.section) {
+			tabs = append(tabs, c.section)
+		}
+	}
+	return tabs
+}
+
+// tabHeight is the height of a tab's settings.
+func (t *Tracker) tabHeight(tab string) int {
+	block := t.px(fieldH) + t.px(6) + t.px(sliderH) + t.px(12)
+	h := 0
+	for _, c := range t.controls {
+		if c.section == tab {
+			h += block
+		}
+	}
+	if tab == micSection {
+		h += t.micRowH()
+	}
+	return h
 }
 
 // micRowH is the height of the mic's name, level bar and Choose microphone
 // button, at the top of the Microphone section.
 func (t *Tracker) micRowH() int {
 	return t.px(rowH) + t.px(2) + t.px(meterH) + t.px(10) + t.px(btnH) + t.px(12)
-}
-
-// headingSpace is the room taken above control i by a section heading (and
-// the line above it, after the first section), or 0 if it doesn't start one.
-func (t *Tracker) headingSpace(i int) int {
-	switch {
-	case i == 0:
-		return t.px(sectionH)
-	case t.controls[i].section != t.controls[i-1].section:
-		return t.px(sectionGap) + t.px(sectionH)
-	}
-	return 0
 }
 
 // PanelOffset is where the settings panel opens relative to the tracker's
@@ -934,23 +971,26 @@ func (t *Tracker) renderPanel(img *image.RGBA, panel image.Rectangle, now time.T
 	t.hits[SurfPanel] = append(t.hits[SurfPanel], hit{r: panel, kind: hitPanel})
 
 	inner := panel.Inset(t.px(panelPad))
-	y := inner.Min.Y
+	t.renderTabs(img, image.Rect(inner.Min.X, inner.Min.Y, inner.Max.X, inner.Min.Y+t.px(tabH)))
+
+	// Just this tab's settings.
+	y := panel.Min.Y + t.panelTop()
+	t.meterBar = image.Rectangle{}
+	if t.tab == micSection {
+		y = t.renderMicRow(img, inner, y)
+	}
 	for i, c := range t.controls {
-		if h := t.headingSpace(i); h > 0 {
-			if i > 0 {
-				// A line between sections, in the middle of the gap.
-				ly := y - t.px(12)/2 + t.px(sectionGap)/2
-				fillSolid(img, image.Rect(inner.Min.X, ly, inner.Max.X, ly+max(1, t.px(1))), colPanelBorder)
-			}
-			y += h
-			drawText(img, t.face, c.section, inner.Min.X, y-t.px(sectionH)/2-t.px(2), colMuted)
-			if c.section == micSection {
-				y = t.renderMicRow(img, inner, y)
-			}
+		if c.section != t.tab {
+			t.tracks[i] = image.Rectangle{}
+			continue
 		}
 		y = t.renderControl(img, i, inner, y, now, wake) + t.px(12)
 	}
 
+	// The buttons stay at the bottom, under a line.
+	y = panel.Max.Y - t.px(panelPad) - t.px(rowH) - 3*(t.px(12)+t.px(btnH))
+	ly := y - t.px(sectionGap)/2
+	fillSolid(img, image.Rect(inner.Min.X, ly, inner.Max.X, ly+max(1, t.px(1))), colPanelBorder)
 	box := t.px(16)
 	row := image.Rect(inner.Min.X, y, inner.Max.X, y+t.px(rowH))
 	cb := image.Rect(row.Min.X, y+(row.Dy()-box)/2, row.Min.X+box, y+(row.Dy()-box)/2+box)
@@ -985,6 +1025,41 @@ func (t *Tracker) renderPanel(img *image.RGBA, panel image.Rectangle, now time.T
 	t.hits[SurfPanel] = append(t.hits[SurfPanel],
 		hit{r: save, kind: hitSave}, hit{r: reset, kind: hitReset},
 		hit{r: change, kind: hitChangeGame}, hit{r: exit, kind: hitExit})
+}
+
+// renderTabs draws the tab row in r, each tab as wide as its label and
+// together filling the row.
+func (t *Tracker) renderTabs(img *image.RGBA, r image.Rectangle) {
+	tabs := t.tabs()
+	label := func(tab string) string {
+		if l, ok := tabLabels[tab]; ok {
+			return l
+		}
+		return tab
+	}
+	gap := t.px(4)
+	textW := 0
+	for _, tab := range tabs {
+		textW += font.MeasureString(t.face, label(tab)).Ceil()
+	}
+	// What is left after the labels is shared out evenly as padding.
+	spare := max(r.Dx()-gap*(len(tabs)-1)-textW, 0)
+	x := r.Min.X
+	for i, tab := range tabs {
+		w := font.MeasureString(t.face, label(tab)).Ceil() + spare/len(tabs)
+		if i == len(tabs)-1 {
+			w = r.Max.X - x
+		}
+		tr := image.Rect(x, r.Min.Y, x+w, r.Max.Y)
+		bg, fg := colButton, colFg
+		if tab == t.tab {
+			bg, fg = colAccent, colOnColor
+		}
+		fillRoundRect(img, tr, float64(t.px(5)), bg)
+		drawTextCentered(img, t.face, fitText(t.face, label(tab), tr.Dx()-t.px(4)), tr, fg)
+		t.hits[SurfPanel] = append(t.hits[SurfPanel], hit{r: tr, kind: hitTab, idx: i})
+		x += w + gap
+	}
 }
 
 // renderMicRow draws the mic's name and the Choose microphone button from
@@ -1058,7 +1133,7 @@ func (t *Tracker) drawMeter(img *image.RGBA) {
 // RefreshMeter redraws just the level bar on the open settings panel, if
 // what it shows has changed. It returns the panel and the area redrawn.
 func (t *Tracker) RefreshMeter() (*image.RGBA, image.Rectangle, bool) {
-	if !t.panelOpen || t.panelImg == nil {
+	if !t.panelOpen || t.panelImg == nil || t.meterBar.Empty() {
 		return nil, image.Rectangle{}, false
 	}
 	if fill, talk := t.meterState(); fill == t.meterFill && talk == t.meterTalk {
@@ -1207,6 +1282,8 @@ func (t *Tracker) MouseDown(s Surface, p image.Point, now time.Time) Action {
 		return ActExit
 	case hitMic:
 		return ActChooseMic
+	case hitTab:
+		t.tab = t.tabs()[h.idx]
 	}
 	return ActNone
 }

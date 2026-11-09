@@ -655,7 +655,7 @@ func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (u
 		switch o.t.Cursor(s, clientPoint(hwnd, cursorPos()).Sub(off)) {
 		case hitDrag, hitPanel:
 			id = idcSizeAll
-		case hitIcon, hitGear, hitSlider, hitOnTop, hitSave, hitReset, hitChangeGame, hitExit, hitMic:
+		case hitIcon, hitGear, hitSlider, hitOnTop, hitSave, hitReset, hitChangeGame, hitExit, hitMic, hitTab:
 			id = idcHand
 		case hitSizeField:
 			id = idcIBeam
