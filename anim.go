@@ -25,6 +25,12 @@ type animSource struct {
 	loops  int // number of extra plays; -1 means forever
 }
 
+// blankSource is an empty image, for one that can't be loaded.
+func blankSource() *animSource {
+	s := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	return &animSource{still: s, bounds: s.Rect, delays: []time.Duration{0}}
+}
+
 func loadSource(path string) *animSource {
 	f, err := os.Open(path)
 	if err != nil {
@@ -98,6 +104,7 @@ type SizedAnim struct {
 	path   string
 	src    *animSource
 	w, h   int
+	gray   bool // frames are made grayscale
 	frames []*image.RGBA
 
 	// Gif playback state: canvas holds frames up to next composited at the
@@ -131,7 +138,7 @@ func (s *SizedAnim) Frame(elapsed time.Duration) (*image.RGBA, time.Duration) {
 	i, d := s.src.frameIndex(elapsed)
 	if s.frames[i] == nil {
 		if s.src.gif == nil {
-			s.frames[i] = scaleTo(s.src.still, s.w, s.h, xdraw.CatmullRom)
+			s.frames[i] = s.finish(scaleTo(s.src.still, s.w, s.h, xdraw.CatmullRom))
 		} else {
 			if s.stream && i < s.next {
 				// Looped round: build again from the first frame.
@@ -169,7 +176,7 @@ func (s *SizedAnim) composite(keep bool) {
 		if s.stream {
 			clear(s.frames) // just the one on show
 		}
-		s.frames[i] = scaleTo(s.canvas, s.w, s.h, xdraw.BiLinear)
+		s.frames[i] = s.finish(scaleTo(s.canvas, s.w, s.h, xdraw.BiLinear))
 	}
 
 	switch disposal {
@@ -182,6 +189,14 @@ func (s *SizedAnim) composite(keep bool) {
 	if s.next == len(g.Image) && !s.stream {
 		s.canvas = nil
 	}
+}
+
+// finish makes a scaled frame grayscale if the frames should be.
+func (s *SizedAnim) finish(img *image.RGBA) *image.RGBA {
+	if s.gray {
+		return grayscale(img)
+	}
+	return img
 }
 
 // scaleTo returns a copy of img stretched to w×h, ignoring the aspect ratio.
@@ -217,43 +232,14 @@ func grayscale(img *image.RGBA) *image.RGBA {
 // character and item, each with its idle image and the one clicked last.
 const keepShown = 4
 
-// AnimCache keeps the icon images, and the few files shown most recently.
+// AnimCache keeps the few character and item files shown most recently.
 // Anything else is loaded again from disk when it is next shown. Missing or
 // broken files are cached as nil, so they aren't retried every frame.
 type AnimCache struct {
-	icons map[string]*image.RGBA
 	shown []*SizedAnim // most recently used first
 }
 
-func NewAnimCache() *AnimCache {
-	return &AnimCache{icons: map[string]*image.RGBA{}}
-}
-
-// Icon returns the first frame of the image at path at its own size, or nil
-// if it can't be loaded.
-func (c *AnimCache) Icon(path string) *image.RGBA {
-	img, ok := c.icons[path]
-	if !ok {
-		img = loadStill(path)
-		c.icons[path] = img
-	}
-	return img
-}
-
-// loadStill returns the first frame of the image at path, or nil if it can't
-// be loaded.
-func loadStill(path string) *image.RGBA {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-	d, _, err := image.Decode(f)
-	if err != nil {
-		return nil
-	}
-	return toRGBA(d)
-}
+func NewAnimCache() *AnimCache { return &AnimCache{} }
 
 // Sized returns the file at path stretched to w×h, or nil if it can't be
 // loaded.

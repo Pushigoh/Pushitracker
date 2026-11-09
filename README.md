@@ -33,16 +33,18 @@ games/
   <game>/
     icons/
       0.png         item display when nothing is clicked (optional)
-      <row>/<n>.png               one icon; each folder is one row
+      <row>/<n>.png               one icon; each folder is one row; a .gif plays
       <row>/<n>-1.png, <n>-2.png  an icon with several stages
     gifs/
       <n>.gif       shown when icon <n> is clicked
-    overlays/
-      <name>.png    drawn behind everything else (optional); a .gif plays
+    overlays/       optional; each image can be a .gif, .png or .jpg
+      <name>.png    drawn behind everything else
+      <n>.png, <n>-1.png, <n>-2.png   named like an icon's stages: shown while the icon is on that stage
+      <n>-0.png     shown while icon <n> isn't collected; without it, its first stage shows in grey
 settings/
 ```
 
-Icons can have any name; the same name finds the icon's gif and the character's image. Icons, rows and overlays are sorted alphabetically, ignoring case, with numbers in order (2 before 10).
+Icons can have any name; the same name finds the icon's gif, the character's image and the icon's overlays. Icons, rows and overlays are sorted alphabetically, ignoring case, with numbers in order (2 before 10).
 
 ## Controls
 
