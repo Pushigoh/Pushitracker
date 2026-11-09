@@ -28,6 +28,7 @@ characters/
     <n>.gif         shown instead of reward.gif for icon <n> (optional)
     talk.gif        shown instead of idle while you talk (optional)
     reward_talk.gif, <n>_talk.gif   the same while talking during a reward (optional)
+    <game>/         reward and <n> images for one game only, named like its games/ folder (optional)
 games/
   <game>/
     icons/
@@ -40,6 +41,8 @@ games/
       <name>.png    drawn behind everything else (optional); a .gif plays
 settings/
 ```
+
+Icons can have any name; the same name finds the icon's gif and the character's image. Icons, rows and overlays are sorted alphabetically, ignoring case, with numbers in order (2 before 10).
 
 ## Controls
 
