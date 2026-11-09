@@ -7,6 +7,7 @@ import (
 	"math"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	xdraw "golang.org/x/image/draw"
@@ -39,7 +40,21 @@ var (
 	colPanel       = withAlpha(rgb(0x1e1f22), 0xf2)
 	colPanelBorder = rgb(0x3a3b40)
 	colField       = rgb(0x2a2b30)
+	colTalk        = rgb(0x3ccf6e)
 )
+
+// meterInterval is how often the mic level redraws while it is shown, and
+// meterH the level bar's height in dp.
+const (
+	meterInterval = 100 * time.Millisecond
+	meterH        = 8
+)
+
+// levelFrac is how far along a level bar a level in dBFS is: the bar runs
+// over the talk threshold's range.
+func levelFrac(db float64) float64 {
+	return math.Max(0, math.Min(1, (db-MinTalkThreshold)/(MaxTalkThreshold-MinTalkThreshold)))
+}
 
 type hitKind int
 
@@ -57,6 +72,7 @@ const (
 	hitReset
 	hitChangeGame
 	hitExit
+	hitMic
 )
 
 type hit struct {
@@ -88,6 +104,7 @@ const (
 	ActConfirmReset // ask first, then reset (see ResetLayout)
 	ActClose
 	ActExit // close, asking first if there are unsaved changes
+	ActChooseMic
 )
 
 // Virtual-key codes the size fields understand.
@@ -185,9 +202,38 @@ type Tracker struct {
 	itemStart  time.Time
 	nextItem   string
 	nextItemAt time.Time
-	charPath   string
-	charStart  time.Time
-	resetAt    time.Time
+	// The character image shown (idle, or a reward until resetAt) and when
+	// it started; idle plays from started, so it keeps one cycle with talk.
+	// charTalk is the reward image's talk version ("" for none).
+	charPath  string
+	charTalk  string
+	charStart time.Time
+	resetAt   time.Time
+
+	// The character's talk image ("" if it has none), shown instead of idle
+	// while the mic is over the threshold.
+	talkPath string
+	// Mic state. The capture thread sets talking and level (dBFS bits) and
+	// reads the thresholds and hold, copies of the settings; gate and the
+	// meter's last post are its own.
+	talking   atomic.Bool
+	micLevel  atomic.Uint64
+	openDb    atomic.Int32
+	closeDb   atomic.Int32
+	hold      atomic.Int32
+	gate      talkGate
+	meterPost time.Time
+	meterAt   int
+	micOn     bool   // capturing
+	micNote   string // a problem, shown after the mic's name
+
+	// The settings panel as last drawn, and its level bar, so the bar alone
+	// can be redrawn as the level changes; meterFill and meterTalk are what
+	// it shows.
+	panelImg  *image.RGBA
+	meterBar  image.Rectangle
+	meterFill int
+	meterTalk bool
 
 	panelOpen bool
 	pressed   int      // icon index held down, -1 if none
@@ -283,7 +329,35 @@ func NewTracker(sel *Selection) *Tracker {
 			get: func() int { return t.gs.ItemSize },
 			set: func(n int) { t.gs.ItemSize, t.itemExact = n, float64(n) },
 		},
+		{
+			section: micSection, label: "Open threshold", unit: "dB", min: MinTalkThreshold, max: MaxTalkThreshold, step: 1,
+			get: func() int { return t.gs.TalkOpenDb },
+			set: func(n int) {
+				t.gs.TalkOpenDb = n
+				t.openDb.Store(int32(n))
+			},
+		},
+		{
+			section: micSection, label: "Close threshold", unit: "dB", min: MinTalkThreshold, max: MaxTalkThreshold, step: 1,
+			get: func() int { return t.gs.TalkCloseDb },
+			set: func(n int) {
+				t.gs.TalkCloseDb = n
+				t.closeDb.Store(int32(n))
+			},
+		},
+		{
+			section: micSection, label: "Talk hold", unit: "ms", min: 0, max: MaxTalkHoldMs, step: 50,
+			get: func() int { return t.gs.TalkHoldMs },
+			set: func(n int) {
+				t.gs.TalkHoldMs = n
+				t.hold.Store(int32(n))
+			},
+		},
 	}
+	t.openDb.Store(int32(t.gs.TalkOpenDb))
+	t.closeDb.Store(int32(t.gs.TalkCloseDb))
+	t.hold.Store(int32(t.gs.TalkHoldMs))
+	t.micLevel.Store(math.Float64bits(micSilence))
 	for i, ov := range t.game.Overlays {
 		t.controls = append(t.controls, &sizeControl{
 			section: "Overlays", label: ov.Name, unit: "%", min: MinOverlaySize, max: MaxOverlaySize, step: 5,
@@ -306,7 +380,80 @@ func NewTracker(sel *Selection) *Tracker {
 
 	t.started = time.Now()
 	t.charPath, t.charStart = characterImage(t.charDir, idleName), t.started
+	t.talkPath = characterImage(t.charDir, talkName)
 	return t
+}
+
+// micSection is the settings panel's microphone section.
+const micSection = "Microphone"
+
+// talkGate decides when the character is talking: from the moment the level
+// reaches the open threshold until it has stayed under the close threshold
+// for the hold time, so it doesn't flicker between words.
+type talkGate struct {
+	talking  bool
+	lastLoud time.Time
+}
+
+// feed takes a level in dBFS; it reports whether talking changed. A close
+// threshold above the open one counts as the open one.
+func (g *talkGate) feed(db, open, close float64, hold time.Duration, now time.Time) bool {
+	was := g.talking
+	close = min(close, open)
+	switch {
+	case math.IsInf(db, -1): // the mic stopped
+		g.talking = false
+	case !g.talking && db >= open:
+		g.talking, g.lastLoud = true, now
+	case g.talking && db >= close:
+		g.lastLoud = now
+	case g.talking && now.Sub(g.lastLoud) >= hold:
+		g.talking = false
+	}
+	return g.talking != was
+}
+
+// MicLevel takes the mic's level in dBFS (-Inf when it stops), from the
+// capture thread. It reports whether the character started or stopped
+// talking, and whether the level bar should be redrawn: at most every
+// meterInterval, and only when the level has moved.
+func (t *Tracker) MicLevel(db float64, now time.Time) (talk, meter bool) {
+	t.micLevel.Store(math.Float64bits(max(db, micSilence)))
+	hold := time.Duration(t.hold.Load()) * time.Millisecond
+	if talk = t.gate.feed(db, float64(t.openDb.Load()), float64(t.closeDb.Load()), hold, now); talk {
+		t.talking.Store(t.gate.talking)
+	}
+	if at := int(levelFrac(db) * 1000); at != t.meterAt && now.Sub(t.meterPost) >= meterInterval {
+		t.meterAt, t.meterPost, meter = at, now, true
+	}
+	return talk, meter
+}
+
+// CanTalk reports whether the character has a talk image.
+func (t *Tracker) CanTalk() bool { return t.talkPath != "" }
+
+// SetMic records whether the mic is capturing, and if not, why (shown in the
+// settings panel). Call it with the capture thread stopped.
+func (t *Tracker) SetMic(on bool, note string) {
+	t.micOn, t.micNote = on, note
+	t.gate = talkGate{}
+	t.talking.Store(false)
+	t.micLevel.Store(math.Float64bits(micSilence))
+}
+
+// micLabel is the chosen mic's name and state, for the settings panel.
+func (t *Tracker) micLabel() string {
+	name := t.settings.MicName
+	if t.settings.MicID == "" {
+		return "None"
+	}
+	if name == "" {
+		name = "Microphone"
+	}
+	if t.micNote != "" {
+		name += " (" + t.micNote + ")"
+	}
+	return name
 }
 
 func (t *Tracker) gifFile(id string) string { return filepath.Join(t.game.GifsDir, id+".gif") }
@@ -583,12 +730,18 @@ func (t *Tracker) Size() image.Point { return t.layout().size }
 func (t *Tracker) PanelSize() image.Point {
 	pad := t.px(panelPad)
 	block := t.px(fieldH) + t.px(6) + t.px(sliderH)
-	h := pad + len(t.controls)*block + (len(t.controls)-1)*t.px(12) +
+	h := pad + len(t.controls)*block + (len(t.controls)-1)*t.px(12) + t.micRowH() +
 		t.px(12) + t.px(rowH) + 3*(t.px(12)+t.px(btnH)) + pad
 	for i := range t.controls {
 		h += t.headingSpace(i)
 	}
 	return image.Pt(t.px(panelWidth), h)
+}
+
+// micRowH is the height of the mic's name, level bar and Choose microphone
+// button, at the top of the Microphone section.
+func (t *Tracker) micRowH() int {
+	return t.px(rowH) + t.px(2) + t.px(meterH) + t.px(10) + t.px(btnH) + t.px(12)
 }
 
 // headingSpace is the room taken above control i by a section heading (and
@@ -636,7 +789,8 @@ func (t *Tracker) CharacterOffset() image.Point {
 func (t *Tracker) tick(now time.Time) {
 	if !t.resetAt.IsZero() && !now.Before(t.resetAt) {
 		t.resetAt = time.Time{}
-		t.charPath, t.charStart = characterImage(t.charDir, idleName), now
+		// Back to idle on its own cycle, which talk shares.
+		t.charPath, t.charTalk, t.charStart = characterImage(t.charDir, idleName), "", t.started
 		t.itemPath, t.nextItem = "", ""
 	}
 	if t.nextItem != "" && !now.Before(t.nextItemAt) {
@@ -697,6 +851,7 @@ func (t *Tracker) Render(now time.Time) (*image.RGBA, time.Time) {
 // RenderPanel draws the settings panel for its own window.
 func (t *Tracker) RenderPanel(now time.Time) (*image.RGBA, time.Time) {
 	img := image.NewRGBA(image.Rectangle{Max: t.PanelSize()})
+	t.panelImg = img
 	t.hits[SurfPanel] = t.hits[SurfPanel][:0]
 	var next time.Time
 	t.renderPanel(img, img.Rect, now, func(at time.Time) {
@@ -729,11 +884,28 @@ func (t *Tracker) RenderItem(now time.Time) (*image.RGBA, time.Time) {
 // The returned image may be a cached frame, so it must not be changed.
 func (t *Tracker) RenderCharacter(now time.Time) (*image.RGBA, time.Time) {
 	t.tick(now)
-	a := t.cache.SizedHeight(t.charPath, t.CharacterHeight())
+	a := t.cache.SizedHeight(t.shownChar(), t.CharacterHeight())
 	if a == nil {
 		return image.NewRGBA(image.Rect(0, 0, 1, 1)), t.resetAt
 	}
 	return t.frameOf(a, t.charStart, t.resetAt, now)
+}
+
+// shownChar is the character image to show: while talking, idle becomes
+// talk and a reward its talk version, if there is one. Each pair plays from
+// the same start, so switching picks up at the same point in the loop.
+func (t *Tracker) shownChar() string {
+	if !t.talking.Load() {
+		return t.charPath
+	}
+	talk := t.talkPath
+	if !t.resetAt.IsZero() {
+		talk = t.charTalk
+	}
+	if talk == "" {
+		return t.charPath
+	}
+	return talk
 }
 
 // animFrame returns the frame of the file at path that is due at now, played
@@ -772,6 +944,9 @@ func (t *Tracker) renderPanel(img *image.RGBA, panel image.Rectangle, now time.T
 			}
 			y += h
 			drawText(img, t.face, c.section, inner.Min.X, y-t.px(sectionH)/2-t.px(2), colMuted)
+			if c.section == micSection {
+				y = t.renderMicRow(img, inner, y)
+			}
 		}
 		y = t.renderControl(img, i, inner, y, now, wake) + t.px(12)
 	}
@@ -810,6 +985,87 @@ func (t *Tracker) renderPanel(img *image.RGBA, panel image.Rectangle, now time.T
 	t.hits[SurfPanel] = append(t.hits[SurfPanel],
 		hit{r: save, kind: hitSave}, hit{r: reset, kind: hitReset},
 		hit{r: change, kind: hitChangeGame}, hit{r: exit, kind: hitExit})
+}
+
+// renderMicRow draws the mic's name and the Choose microphone button from
+// y, and returns the y below them.
+func (t *Tracker) renderMicRow(img *image.RGBA, inner image.Rectangle, y int) int {
+	col := colFg
+	if t.settings.MicID == "" || t.micNote != "" {
+		col = colMuted
+	}
+	drawText(img, t.face, fitText(t.face, t.micLabel(), inner.Dx()), inner.Min.X, y+t.px(rowH)/2, col)
+	y += t.px(rowH) + t.px(2)
+
+	t.meterBar = image.Rect(inner.Min.X, y, inner.Max.X, y+t.px(meterH))
+	t.drawMeter(img)
+	y = t.meterBar.Max.Y + t.px(10)
+
+	btn := image.Rect(inner.Min.X, y, inner.Max.X, y+t.px(btnH))
+	fillRoundRect(img, btn, float64(t.px(5)), colButton)
+	drawTextCentered(img, t.face, "Choose microphone", btn, colFg)
+	t.hits[SurfPanel] = append(t.hits[SurfPanel], hit{r: btn, kind: hitMic})
+	return btn.Max.Y + t.px(12)
+}
+
+// meterState is how far the level bar is filled, and whether it shows
+// talking.
+func (t *Tracker) meterState() (int, bool) {
+	if !t.micOn {
+		return 0, false
+	}
+	return int(levelFrac(math.Float64frombits(t.micLevel.Load())) * float64(t.meterBar.Dx())), t.talking.Load()
+}
+
+// meterArea is what drawMeter paints: the bar, and the threshold lines,
+// which stick out above and below it.
+func (t *Tracker) meterArea() image.Rectangle {
+	return t.meterBar.Inset(-t.px(2)).Intersect(image.Rect(t.meterBar.Min.X, -1<<20, t.meterBar.Max.X, 1<<20))
+}
+
+// drawMeter draws the mic's level, green while the character talks, with
+// lines at the open (white) and close (grey) thresholds.
+func (t *Tracker) drawMeter(img *image.RGBA) {
+	bg := premul(colPanel)
+	area := t.meterArea().Intersect(img.Rect)
+	for y := area.Min.Y; y < area.Max.Y; y++ {
+		for x := area.Min.X; x < area.Max.X; x++ {
+			img.SetRGBA(x, y, bg)
+		}
+	}
+	bar := t.meterBar
+	r := float64(bar.Dy()) / 2
+	fillRoundRect(img, bar, r, colButton)
+	t.meterFill, t.meterTalk = t.meterState()
+	if t.meterFill > 0 {
+		lc := colMuted
+		if t.meterTalk {
+			lc = colTalk
+		}
+		fillRoundRect(img, image.Rect(bar.Min.X, bar.Min.Y, bar.Min.X+t.meterFill, bar.Max.Y), r, lc)
+	}
+	k := max(1, t.px(1))
+	for _, l := range []struct {
+		db  int
+		col color.NRGBA
+	}{{min(t.gs.TalkCloseDb, t.gs.TalkOpenDb), colMuted}, {t.gs.TalkOpenDb, colFg}} {
+		x := bar.Min.X + int(levelFrac(float64(l.db))*float64(bar.Dx()))
+		x = min(max(x, bar.Min.X+k), bar.Max.X-k)
+		fillSolid(img, image.Rect(x-k, bar.Min.Y-t.px(2), x+k, bar.Max.Y+t.px(2)), l.col)
+	}
+}
+
+// RefreshMeter redraws just the level bar on the open settings panel, if
+// what it shows has changed. It returns the panel and the area redrawn.
+func (t *Tracker) RefreshMeter() (*image.RGBA, image.Rectangle, bool) {
+	if !t.panelOpen || t.panelImg == nil {
+		return nil, image.Rectangle{}, false
+	}
+	if fill, talk := t.meterState(); fill == t.meterFill && talk == t.meterTalk {
+		return nil, image.Rectangle{}, false
+	}
+	t.drawMeter(t.panelImg)
+	return t.panelImg, t.meterArea(), true
 }
 
 // renderControl draws "label [field] px" and a slider for control i starting
@@ -949,6 +1205,8 @@ func (t *Tracker) MouseDown(s Surface, p image.Point, now time.Time) Action {
 		return ActClose
 	case hitExit:
 		return ActExit
+	case hitMic:
+		return ActChooseMic
 	}
 	return ActNone
 }
@@ -977,11 +1235,14 @@ func (t *Tracker) MouseUp(surf Surface, p image.Point, now time.Time) {
 	delay := time.Duration(t.gs.ItemDelayMs) * time.Millisecond
 	t.nextItem, t.nextItemAt = t.gifFile(id), now.Add(delay)
 	// The character reacts with its <id> image if it has one, otherwise its
-	// reward image.
+	// reward image, each with an optional _talk version for while talking.
+	base := id
 	t.charPath, t.charStart = characterImage(t.charDir, id), now
 	if t.charPath == "" {
+		base = rewardName
 		t.charPath = characterImage(t.charDir, rewardName)
 	}
+	t.charTalk = characterImage(t.charDir, base+talkSuffix)
 	// One shared deadline, the reward time after the item appears: a new
 	// click restarts it.
 	t.resetAt = t.nextItemAt.Add(time.Duration(t.gs.RewardSeconds) * time.Second)
@@ -1056,13 +1317,24 @@ func (t *Tracker) Key(vk int, now time.Time) bool {
 
 // Char handles a typed character while a size field is focused.
 func (t *Tracker) Char(r rune, now time.Time) bool {
-	if t.editIdx < 0 || r < '0' || r > '9' {
+	if t.editIdx < 0 {
+		return false
+	}
+	c := t.controls[t.editIdx]
+	// A minus sign starts a negative value, where the control has them.
+	minus := r == '-' && c.min < 0
+	if !minus && (r < '0' || r > '9') {
 		return false
 	}
 	if t.editFresh {
 		t.editText, t.editFresh = "", false
 	}
-	if len(t.editText) < len(strconv.Itoa(t.controls[t.editIdx].max)) {
+	switch {
+	case minus:
+		if t.editText == "" {
+			t.editText = "-"
+		}
+	case len(t.editText) < max(len(strconv.Itoa(c.max)), len(strconv.Itoa(c.min))):
 		t.editText += string(r)
 	}
 	t.caretStart = now

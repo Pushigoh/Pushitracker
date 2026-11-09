@@ -27,8 +27,17 @@ const (
 	MinRewardSeconds   = 1
 	MaxRewardSeconds   = 60
 	MaxItemDelayMs     = 10000
-	MinOverlaySize     = 10 // percent of the overlay's own size
-	MaxOverlaySize     = 400
+	// Mic levels, in dB below full scale: the character starts talking over
+	// the open threshold and stops under the close threshold.
+	MinTalkThreshold = -60
+	MaxTalkThreshold = 0
+	DefaultTalkOpen  = -40
+	DefaultTalkClose = -50
+	// How long the character keeps talking after the level drops.
+	MaxTalkHoldMs     = 2000
+	DefaultTalkHoldMs = 250
+	MinOverlaySize    = 10 // percent of the overlay's own size
+	MaxOverlaySize    = 400
 )
 
 // Settings are the setup choices, kept in <settings folder>/settings.json.
@@ -41,6 +50,10 @@ type Settings struct {
 	Character      string `json:"character"`
 	Game           string `json:"game"`
 	DisplaySeconds int    `json:"displaySeconds"`
+	// The microphone the character talks with: Windows' ID for it (empty for
+	// none) and its name when it was chosen.
+	MicID   string `json:"microphone,omitempty"`
+	MicName string `json:"microphoneName,omitempty"`
 
 	dir string // the settings folder this was loaded from and saves to
 }
@@ -58,7 +71,13 @@ type GameSettings struct {
 	RewardSeconds int `json:"rewardSeconds"`
 	// How long after a click the item display changes; the character
 	// changes at once.
-	ItemDelayMs int     `json:"itemDelayMs"`
+	ItemDelayMs int `json:"itemDelayMs"`
+	// When the mic gets louder than TalkOpenDb (dBFS), the character shows
+	// its talk image, until it has been quieter than TalkCloseDb for
+	// TalkHoldMs.
+	TalkOpenDb  int     `json:"talkOpenDb"`
+	TalkCloseDb int     `json:"talkCloseDb"`
+	TalkHoldMs  int     `json:"talkHoldMs"`
 	AlwaysOnTop bool    `json:"alwaysOnTop"`
 	TrackerPos  *[2]int `json:"trackerPos,omitempty"`
 	CharPos     *[2]int `json:"characterPos,omitempty"`
@@ -111,6 +130,7 @@ func (s *Settings) LoadGameSettings(game string) *GameSettings {
 		CharSize: DefaultCharSize, ItemSize: DefaultItemSize, path: s.gamePath(game),
 		// Until set here, the time from settings.json (8 seconds by default).
 		RewardSeconds: s.DisplaySeconds,
+		TalkOpenDb:    DefaultTalkOpen, TalkCloseDb: DefaultTalkClose, TalkHoldMs: DefaultTalkHoldMs,
 	}
 	if b, err := os.ReadFile(g.path); err == nil {
 		_ = json.Unmarshal(b, g)
@@ -122,6 +142,9 @@ func (s *Settings) LoadGameSettings(game string) *GameSettings {
 	g.RowSpacing = min(max(g.RowSpacing, 0), MaxRowSpacing)
 	g.RewardSeconds = min(max(g.RewardSeconds, MinRewardSeconds), MaxRewardSeconds)
 	g.ItemDelayMs = min(max(g.ItemDelayMs, 0), MaxItemDelayMs)
+	g.TalkOpenDb = min(max(g.TalkOpenDb, MinTalkThreshold), MaxTalkThreshold)
+	g.TalkCloseDb = min(max(g.TalkCloseDb, MinTalkThreshold), MaxTalkThreshold)
+	g.TalkHoldMs = min(max(g.TalkHoldMs, 0), MaxTalkHoldMs)
 	for k, v := range g.OverlaySize {
 		g.OverlaySize[k] = clampSize(v, MinOverlaySize, MaxOverlaySize, 100)
 	}

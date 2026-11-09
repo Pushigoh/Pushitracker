@@ -41,6 +41,7 @@ var (
 	pTranslateMessage             = user32.NewProc("TranslateMessage")
 	pDispatchMessageW             = user32.NewProc("DispatchMessageW")
 	pSendMessageW                 = user32.NewProc("SendMessageW")
+	pPostMessageW                 = user32.NewProc("PostMessageW")
 	pPostQuitMessage              = user32.NewProc("PostQuitMessage")
 	pSetCapture                   = user32.NewProc("SetCapture")
 	pMessageBoxW                  = user32.NewProc("MessageBoxW")
@@ -72,56 +73,60 @@ var (
 )
 
 const (
-	wsPopup        = 0x80000000
-	wsExLayered    = 0x00080000
-	wsExAppWindow  = 0x00040000
-	wsExToolWindow = 0x00000080
-	swShow         = 5
-	swShowNA       = 8
-	swHide         = 0
-	wmDestroy      = 0x0002
-	wmMove         = 0x0003
-	wmKillFocus    = 0x0008
-	wmClose        = 0x0010
-	wmSetCursor    = 0x0020
-	wmNCLButtonDn  = 0x00A1
-	wmKeyDown      = 0x0100
-	wmChar         = 0x0102
-	wmMouseMove    = 0x0200
-	wmLButtonDown  = 0x0201
-	wmLButtonUp    = 0x0202
-	wmRButtonDown  = 0x0204
-	wmMouseWheel   = 0x020A
-	wmCaptureChg   = 0x0215
-	wmExitSizeMove = 0x0232
-	wmDpiChanged   = 0x02E0
-	wmTimer        = 0x0113
-	mkShift        = 0x0004
-	mkControl      = 0x0008
-	vkShift        = 0x10
-	vkControl      = 0x11
-	vkMenu         = 0x12 // Alt
-	vkZ            = 0x5A
-	wmSysCommand   = 0x0112
-	wmEnterSizeMov = 0x0231
-	scKeyMenu      = 0xF100
-	htCaption      = 2
-	htClient       = 1
-	idcArrow       = 32512
-	idcIBeam       = 32513
-	idcSizeAll     = 32646
-	idcHand        = 32649
-	ulwAlpha       = 2
-	acSrcAlpha     = 1
-	imageIcon      = 1
-	lrDefaultSize  = 0x0040
-	lrShared       = 0x8000
-	swpNoSize      = 0x0001
-	swpNoMove      = 0x0002
-	swpNoZOrder    = 0x0004
-	swpNoActivate  = 0x0010
-	smCxScreen     = 0
-	smCyScreen     = 1
+	wsPopup           = 0x80000000
+	wsExLayered       = 0x00080000
+	wsExAppWindow     = 0x00040000
+	wsExToolWindow    = 0x00000080
+	swShow            = 5
+	swShowNA          = 8
+	swHide            = 0
+	wmDestroy         = 0x0002
+	wmMove            = 0x0003
+	wmKillFocus       = 0x0008
+	wmClose           = 0x0010
+	wmSetCursor       = 0x0020
+	wmNCLButtonDn     = 0x00A1
+	wmKeyDown         = 0x0100
+	wmChar            = 0x0102
+	wmMouseMove       = 0x0200
+	wmLButtonDown     = 0x0201
+	wmLButtonUp       = 0x0202
+	wmRButtonDown     = 0x0204
+	wmMouseWheel      = 0x020A
+	wmCaptureChg      = 0x0215
+	wmExitSizeMove    = 0x0232
+	wmDpiChanged      = 0x02E0
+	wmTimer           = 0x0113
+	wmTalk            = 0x8001 // WM_APP+1: the character started or stopped talking
+	wmMicPicked       = 0x8002 // the mic picker closed
+	wmMicLevel        = 0x8003 // the mic's level has moved
+	mkShift           = 0x0004
+	mkControl         = 0x0008
+	vkShift           = 0x10
+	vkControl         = 0x11
+	vkMenu            = 0x12 // Alt
+	vkZ               = 0x5A
+	wmSysCommand      = 0x0112
+	wmEnterSizeMov    = 0x0231
+	scKeyMenu         = 0xF100
+	htCaption         = 2
+	htClient          = 1
+	idcArrow          = 32512
+	idcIBeam          = 32513
+	idcSizeAll        = 32646
+	idcHand           = 32649
+	ulwAlpha          = 2
+	acSrcAlpha        = 1
+	imageIcon         = 1
+	lrDefaultSize     = 0x0040
+	lrShared          = 0x8000
+	swpNoSize         = 0x0001
+	swpNoMove         = 0x0002
+	swpAsyncWindowPos = 0x4000
+	swpNoZOrder       = 0x0004
+	swpNoActivate     = 0x0010
+	smCxScreen        = 0
+	smCyScreen        = 1
 	// DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 	dpiPerMonitorV2 = ^uintptr(3)
 )
@@ -255,6 +260,17 @@ type overlay struct {
 	panelOffSet bool
 	panelMoved  bool // dragged, or placed from the settings file
 	panelShown  bool
+
+	// Stops the mic capture (nil when not capturing), and the mic picker's
+	// answer while it is open.
+	micStop    func()
+	micPicked  chan micPick
+	pickerOpen bool
+}
+
+type micPick struct {
+	mic Mic
+	ok  bool
 }
 
 var (
@@ -284,7 +300,7 @@ func runTracker(t *Tracker) {
 		pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
 	})
 
-	o := &overlay{t: t, dragPart: -1}
+	o := &overlay{t: t, dragPart: -1, micPicked: make(chan micPick, 1)}
 	current = o
 	defer func() { current = nil }()
 
@@ -349,6 +365,8 @@ func runTracker(t *Tracker) {
 		uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(panelTitle)),
 		wsPopup, uintptr(x), uintptr(y), 100, 100, o.main.hwnd, 0, uintptr(instance), 0)
 
+	o.startMic()
+	defer o.stopMic()
 	o.render()
 	o.saved = o.snapshot()
 	o.applyTopmost()
@@ -411,6 +429,13 @@ func (o *overlay) mainProc(message, wParam, lParam uintptr) (uintptr, bool) {
 	switch message {
 	case wmTimer:
 		o.renderDue()
+	case wmTalk:
+		o.draw([5]bool{false, true})
+		o.refreshMeter()
+	case wmMicLevel:
+		o.refreshMeter()
+	case wmMicPicked:
+		o.micChosen()
 	case wmDpiChanged:
 		o.t.SetScale(float64(wParam&0xffff) / 96)
 		o.render()
@@ -560,6 +585,8 @@ func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (u
 		case ActExit:
 			o.exit()
 			return 0, true
+		case ActChooseMic:
+			o.chooseMic()
 		case ActConfirmReset:
 			if confirmReset(o.panel.hwnd) {
 				o.t.ResetLayout()
@@ -628,7 +655,7 @@ func (o *overlay) inputProc(s Surface, hwnd, message, wParam, lParam uintptr) (u
 		switch o.t.Cursor(s, clientPoint(hwnd, cursorPos()).Sub(off)) {
 		case hitDrag, hitPanel:
 			id = idcSizeAll
-		case hitIcon, hitGear, hitSlider, hitOnTop, hitSave, hitReset, hitChangeGame, hitExit:
+		case hitIcon, hitGear, hitSlider, hitOnTop, hitSave, hitReset, hitChangeGame, hitExit, hitMic:
 			id = idcHand
 		case hitSizeField:
 			id = idcIBeam
@@ -877,16 +904,103 @@ func (o *overlay) current() GameSettings {
 	return g
 }
 
+// snapshot is what Save would write, to compare with what was: this game's
+// settings and the mic, which is kept in settings.json.
 func (o *overlay) snapshot() []byte {
-	b, _ := json.Marshal(o.current())
+	b, _ := json.Marshal(struct {
+		Game GameSettings
+		Mic  string
+	}{o.current(), o.t.settings.MicID})
 	return b
 }
 
-// save writes this game's settings file.
+// save writes this game's settings file, and settings.json for the mic.
 func (o *overlay) save() {
 	*o.t.gs = o.current()
 	o.t.SaveGame()
+	_ = o.t.settings.Save()
 	o.saved = o.snapshot()
+}
+
+// startMic starts capturing from the chosen mic, for the level bar and, if
+// the character has a talk image, to talk.
+func (o *overlay) startMic() {
+	o.stopMic()
+	s := o.t.settings
+	if s.MicID == "" {
+		o.t.SetMic(false, "")
+		return
+	}
+	hwnd := o.main.hwnd
+	stop, err := startMic(s.MicID, func(db float64) {
+		talk, meter := o.t.MicLevel(db, time.Now())
+		if talk {
+			pPostMessageW.Call(hwnd, wmTalk, 0, 0)
+		} else if meter {
+			pPostMessageW.Call(hwnd, wmMicLevel, 0, 0)
+		}
+	})
+	if err != nil {
+		o.t.SetMic(false, "not available")
+		return
+	}
+	note := ""
+	if !o.t.CanTalk() {
+		note = "no talk image"
+	}
+	o.t.SetMic(true, note)
+	o.micStop = stop
+}
+
+func (o *overlay) stopMic() {
+	if o.micStop != nil {
+		o.micStop()
+		o.micStop = nil
+		o.t.SetMic(false, "")
+	}
+}
+
+// refreshMeter redraws the settings panel's level bar, if it is showing and
+// has changed.
+func (o *overlay) refreshMeter() {
+	if !o.panelShown {
+		return
+	}
+	if img, r, ok := o.t.RefreshMeter(); ok {
+		o.panel.pushArea(img, r)
+	}
+}
+
+// chooseMic opens the mic picker; its answer comes back as wmMicPicked.
+func (o *overlay) chooseMic() {
+	if o.pickerOpen {
+		return
+	}
+	o.pickerOpen = true
+	hwnd, id := o.main.hwnd, o.t.settings.MicID
+	go func() {
+		m, ok := runMicPicker(id)
+		o.micPicked <- micPick{m, ok}
+		pPostMessageW.Call(hwnd, wmMicPicked, 0, 0)
+	}()
+}
+
+// micChosen switches to the mic picked, if one was. Like any change, it is
+// kept on Save.
+func (o *overlay) micChosen() {
+	select {
+	case p := <-o.micPicked:
+		o.pickerOpen = false
+		if p.ok {
+			o.t.settings.MicID, o.t.settings.MicName = p.mic.ID, p.mic.Name
+			if p.mic.ID == "" {
+				o.t.settings.MicName = ""
+			}
+			o.startMic()
+		}
+		o.render()
+	default:
+	}
 }
 
 // exit closes the tracker, first asking whether to save if anything has
@@ -1174,6 +1288,30 @@ func (w *layered) push(img *image.RGBA) {
 	src := img.Pix
 	for i := 0; i < len(dst); i += 4 {
 		dst[i], dst[i+1], dst[i+2], dst[i+3] = src[i+2], src[i+1], src[i], src[i+3]
+	}
+	s := size{int32(sz.X), int32(sz.Y)}
+	var origin point
+	blend := blendFunction{alphaFormat: acSrcAlpha, constantAlpha: 255}
+	pUpdateLayeredWindow.Call(w.hwnd, 0, 0, uintptr(unsafe.Pointer(&s)), w.memDC,
+		uintptr(unsafe.Pointer(&origin)), 0, uintptr(unsafe.Pointer(&blend)), ulwAlpha)
+}
+
+// pushArea updates just r of the image last pushed, after it has been drawn
+// on.
+func (w *layered) pushArea(img *image.RGBA, r image.Rectangle) {
+	sz := img.Rect.Size()
+	r = r.Intersect(img.Rect)
+	if img != w.shown || w.bmpSize != sz || r.Empty() {
+		w.shown = nil
+		w.push(img)
+		return
+	}
+	dst := unsafe.Slice((*byte)(w.bits), sz.X*sz.Y*4)
+	for y := r.Min.Y; y < r.Max.Y; y++ {
+		for i := (y*sz.X + r.Min.X) * 4; i < (y*sz.X+r.Max.X)*4; i += 4 {
+			src := img.Pix[i : i+4]
+			dst[i], dst[i+1], dst[i+2], dst[i+3] = src[2], src[1], src[0], src[3]
+		}
 	}
 	s := size{int32(sz.X), int32(sz.Y)}
 	var origin point

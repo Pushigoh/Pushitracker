@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"gioui.org/app"
 	"gioui.org/font"
@@ -15,6 +18,7 @@ import (
 	"gioui.org/io/system"
 	"gioui.org/layout"
 	"gioui.org/op"
+	"gioui.org/op/clip"
 	"gioui.org/op/paint"
 	"gioui.org/text"
 	"gioui.org/unit"
@@ -91,21 +95,34 @@ type configWindow struct {
 	gamesBtn    widget.Clickable
 	settingsBtn widget.Clickable
 	startBtn    widget.Clickable
-	noChar      bool // no character was chosen on purpose
-	list        widget.List
+	micBtn      widget.Clickable
+	micOpen     bool // the mic picker is open
+	micPicked   chan micPick
+	micMissing  bool // the chosen mic isn't plugged in
+	// The chosen mic's level (dBFS bits) for its level bar, and how to stop
+	// capturing it (nil when not).
+	micLevel              atomic.Uint64
+	micStop               func()
+	micOpenDb, micCloseDb int // the chosen game's talk thresholds
+	lastDraw              atomic.Int64
+	noChar                bool // no character was chosen on purpose
+	list                  widget.List
 }
 
 // runConfigWindow shows the setup window and blocks until it closes. It
 // returns nil if the window was closed without pressing Start. s may be
 // replaced when another settings folder is picked.
 func runConfigWindow(th *material.Theme, s *Settings) *Selection {
-	c := &configWindow{th: th, settings: s, picked: make(chan pick, 1)}
+	c := &configWindow{th: th, settings: s, picked: make(chan pick, 1), micPicked: make(chan micPick, 1)}
+	c.micMissing = micMissing(s.MicID)
+	defer c.stopMic()
 	c.list.Axis = layout.Vertical
 	c.rescan()
 
 	w := new(app.Window)
 	w.Option(app.Title(appName()+" – Setup"), app.Size(unit.Dp(600), unit.Dp(560)), app.MinSize(unit.Dp(460), unit.Dp(420)))
 
+	c.startMic(w)
 	var ops op.Ops
 	started := false
 	for {
@@ -158,7 +175,8 @@ func (c *configWindow) rescan() {
 	c.game, c.gameErr = nil, nil
 	if c.hasChoice(c.games, s.Game) {
 		c.game, c.gameErr = LoadGame(s.GamesDir, s.Game)
-		c.gameIcon = s.LoadGameSettings(s.Game).IconSize
+		gs := s.LoadGameSettings(s.Game)
+		c.gameIcon, c.micOpenDb, c.micCloseDb = gs.IconSize, gs.TalkOpenDb, min(gs.TalkCloseDb, gs.TalkOpenDb)
 	}
 
 	c.settingsN = "Will be created on Start"
@@ -256,6 +274,27 @@ func (c *configWindow) update(gtx layout.Context, w *app.Window) bool {
 			c.applyPick(p)
 		}
 	default:
+	}
+	select {
+	case p := <-c.micPicked:
+		c.micOpen = false
+		if p.ok {
+			s.MicID, s.MicName, c.micMissing = p.mic.ID, p.mic.Name, false
+			if p.mic.ID == "" {
+				s.MicName = ""
+			}
+			c.startMic(w)
+		}
+	default:
+	}
+	if c.micBtn.Clicked(gtx) && !c.micOpen {
+		c.micOpen = true
+		id := s.MicID
+		go func() {
+			m, ok := runMicPicker(id)
+			c.micPicked <- micPick{m, ok}
+			w.Invalidate()
+		}()
 	}
 
 	if !c.browsing {
@@ -362,6 +401,11 @@ func (c *configWindow) layout(gtx layout.Context) layout.Dimensions {
 		buttons(c.chars, s.Character),
 		status(c.charsErr, charStatus),
 
+		heading("Microphone"),
+		layout.Rigid(c.micRow()),
+		layout.Rigid(c.micMeter),
+		status(nil, c.micStatus()),
+
 		heading("Games"),
 		layout.Rigid(c.pathRow(s.GamesDir, &c.gamesBtn)),
 		buttons(c.games, s.Game),
@@ -391,6 +435,109 @@ func (c *configWindow) layout(gtx layout.Context) layout.Dimensions {
 				})
 			}),
 		)
+	})
+}
+
+// micRow shows the chosen mic and the Choose microphone button.
+func (c *configWindow) micRow() layout.Widget {
+	return func(gtx layout.Context) layout.Dimensions {
+		s := c.settings
+		return layout.Flex{Alignment: layout.Middle}.Layout(gtx,
+			layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+				l := material.Body2(c.th, s.MicName)
+				if s.MicID == "" {
+					l.Text, l.Color = "None (mic off)", colMuted
+				} else if l.Text == "" {
+					l.Text = "Microphone"
+				}
+				l.MaxLines = 2
+				return l.Layout(gtx)
+			}),
+			layout.Rigid(layout.Spacer{Width: 10}.Layout),
+			layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				if c.micOpen {
+					gtx = gtx.Disabled()
+				}
+				b := material.Button(c.th, &c.micBtn, "Choose microphone")
+				b.Background = colButton
+				return b.Layout(gtx)
+			}),
+		)
+	}
+}
+
+// micStatus is a problem with the chosen mic, if there is one.
+func (c *configWindow) micStatus() string {
+	s := c.settings
+	switch {
+	case s.MicID == "":
+		return ""
+	case c.micMissing:
+		return "This microphone isn't plugged in or is turned off"
+	case s.Character != "" && characterImage(filepath.Join(s.CharsDir, s.Character), talkName) == "":
+		return "This character has no talk image"
+	}
+	return ""
+}
+
+// startMic captures from the chosen mic for its level bar, redrawing the
+// window at most every meterInterval.
+func (c *configWindow) startMic(w *app.Window) {
+	c.stopMic()
+	c.micLevel.Store(math.Float64bits(micSilence))
+	if c.settings.MicID == "" || c.micMissing {
+		return
+	}
+	stop, err := startMic(c.settings.MicID, func(db float64) {
+		c.micLevel.Store(math.Float64bits(max(db, micSilence)))
+		now := time.Now().UnixMilli()
+		if last := c.lastDraw.Load(); now-last >= meterInterval.Milliseconds() && c.lastDraw.CompareAndSwap(last, now) {
+			w.Invalidate()
+		}
+	})
+	if err != nil {
+		c.micMissing = true
+		return
+	}
+	c.micStop = stop
+}
+
+func (c *configWindow) stopMic() {
+	if c.micStop != nil {
+		c.micStop()
+		c.micStop = nil
+	}
+}
+
+// micMeter is the chosen mic's level bar, with lines at the game's open
+// (white) and close (grey) thresholds.
+func (c *configWindow) micMeter(gtx layout.Context) layout.Dimensions {
+	if c.micStop == nil {
+		return layout.Dimensions{}
+	}
+	return layout.Inset{Top: 8}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+		w, h := gtx.Constraints.Max.X, gtx.Dp(meterH)
+		bar := image.Rect(0, 0, w, h)
+		paint.FillShape(gtx.Ops, colButton, clip.UniformRRect(bar, h/2).Op(gtx.Ops))
+		db := math.Float64frombits(c.micLevel.Load())
+		lc := colMuted
+		if db >= float64(c.micOpenDb) {
+			lc = colTalk
+		}
+		if lx := int(levelFrac(db) * float64(w)); lx > 0 {
+			paint.FillShape(gtx.Ops, lc, clip.UniformRRect(image.Rect(0, 0, lx, h), h/2).Op(gtx.Ops))
+		}
+		if c.game != nil {
+			k := max(gtx.Dp(1), 1)
+			for _, l := range []struct {
+				db  int
+				col color.NRGBA
+			}{{c.micCloseDb, colMuted}, {c.micOpenDb, colFg}} {
+				tx := min(max(int(levelFrac(float64(l.db))*float64(w)), k), w-k)
+				paint.FillShape(gtx.Ops, l.col, clip.Rect(image.Rect(tx-k, -gtx.Dp(2), tx+k, h+gtx.Dp(2))).Op())
+			}
+		}
+		return layout.Dimensions{Size: bar.Size()}
 	})
 }
 
