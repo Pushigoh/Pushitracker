@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
+	"time"
 )
 
 const (
 	settingsFile    = "settings.json"
-	locationFile    = "location.json"
+	settingsFolder  = "settings"
 	MinIconSize     = 16
 	MaxIconSize     = 128
 	DefaultIconSize = 32
@@ -40,27 +40,34 @@ const (
 	MaxOverlaySize    = 400
 )
 
-// Settings are the setup choices, kept in <settings folder>/settings.json.
-// Each game's tracker settings are in their own file next to it (see
-// GameSettings). The settings folder is either a "settings" folder next to
-// the exe, the one last picked in setup, or %AppData%\pushitracker.
+// Settings are the setup choices. The character and microphone are saved
+// with each game (see GameSettings), and setup starts on the game saved last.
+// The games and characters folders are the ones beside the exe, unless others
+// have been picked with Browse: only then is a settings.json kept beside the
+// exe, holding just those folders (see folderFile).
 type Settings struct {
-	CharsDir       string `json:"charsDir"`
-	GamesDir       string `json:"gamesDir"`
-	Character      string `json:"character"`
-	Game           string `json:"game"`
-	DisplaySeconds int    `json:"displaySeconds"`
+	CharsDir  string
+	GamesDir  string
+	Character string
+	Game      string
 	// The microphone the character talks with: Windows' ID for it (empty for
 	// none) and its name when it was chosen.
-	MicID   string `json:"microphone,omitempty"`
-	MicName string `json:"microphoneName,omitempty"`
+	MicID   string
+	MicName string
 
-	dir string // the settings folder this was loaded from and saves to
+	home  string   // the exe's folder, where folderFile goes ("" for none)
+	found Detected // the folders found beside the exe
+	// The settings folder older versions kept beside the exe, with every
+	// game's file in it: a game's file there is read until the game saves
+	// its own.
+	legacy       string
+	rewardSecs   int  // the reward time for games without one saved
+	savedChoices bool // the game's own choices were loaded
 }
 
 // GameSettings are one game's tracker settings, kept in
-// <settings folder>/<game>.json and written when Save is pressed in the
-// settings panel.
+// games/<game>/settings/settings.json. The setup choices are written when
+// Start is pressed, and the rest when Save is pressed in the settings panel.
 type GameSettings struct {
 	IconSize    int `json:"iconSize"`
 	IconSpacing int `json:"iconSpacing"`   // space between icons in a row
@@ -91,49 +98,151 @@ type GameSettings struct {
 	// Overlays shown at other than their own size, in percent, by file name.
 	OverlaySize map[string]int `json:"overlaySizes,omitempty"`
 
+	// The choices made in setup for this game: the character ("" for none)
+	// and the mic.
+	Character string `json:"character"`
+	MicID     string `json:"microphone,omitempty"`
+	MicName   string `json:"microphoneName,omitempty"`
+
 	path string
 }
 
-// appDataDir is the fallback settings folder.
-func appDataDir() string {
-	dir, err := os.UserConfigDir()
-	if err != nil {
-		dir = "."
-	}
-	return filepath.Join(dir, "pushitracker")
+// legacySettings is the setup file of older versions.
+type legacySettings struct {
+	CharsDir       string `json:"charsDir"`
+	GamesDir       string `json:"gamesDir"`
+	Character      string `json:"character"`
+	Game           string `json:"game"`
+	DisplaySeconds int    `json:"displaySeconds"`
+	MicID          string `json:"microphone"`
+	MicName        string `json:"microphoneName"`
 }
 
-// LoadSettings reads dir/settings.json, filling in defaults for anything
-// missing. A missing or unreadable file just gives the defaults.
-func LoadSettings(dir string) *Settings {
-	s := &Settings{DisplaySeconds: 8}
-	if b, err := os.ReadFile(filepath.Join(dir, settingsFile)); err == nil {
-		_ = json.Unmarshal(b, s)
+// defaultRewardSeconds is how long a reward shows until a game sets its own.
+const defaultRewardSeconds = 8
+
+// SelectGame picks a game, and the character and mic saved with it if it has
+// any; otherwise the current ones stay.
+func (s *Settings) SelectGame(name string) {
+	s.Game, s.savedChoices = name, false
+	p := s.gamePath(name)
+	if p == "" || !fileExists(p) {
+		return
 	}
-	if s.DisplaySeconds <= 0 {
-		s.DisplaySeconds = 8
-	}
-	s.dir = dir
-	return s
+	g := s.LoadGameSettings(name)
+	s.Character, s.MicID, s.MicName = g.Character, g.MicID, g.MicName
+	s.savedChoices = true
 }
 
-func (s *Settings) Dir() string { return s.dir }
+// ChoseNoCharacter reports whether the game was saved with no character.
+func (s *Settings) ChoseNoCharacter() bool { return s.savedChoices && s.Character == "" }
 
-func (s *Settings) Save() error { return writeJSON(filepath.Join(s.dir, settingsFile), s) }
+// lastGame is the game whose settings were saved most recently, or "".
+func (s *Settings) lastGame() string {
+	games, _ := subdirs(s.GamesDir)
+	var last string
+	var at time.Time
+	for _, g := range games {
+		if fi, err := os.Stat(s.gamePath(g)); err == nil && fi.ModTime().After(at) {
+			last, at = g, fi.ModTime()
+		}
+	}
+	return last
+}
 
-func (s *Settings) gamePath(game string) string { return filepath.Join(s.dir, game+".json") }
+// Save writes the setup choices into the chosen game's settings, and the
+// folders into folderFile if they aren't the ones beside the exe.
+func (s *Settings) Save() error {
+	if err := s.saveFolders(); err != nil {
+		return err
+	}
+	if s.Game == "" {
+		return nil
+	}
+	g := s.LoadGameSettings(s.Game)
+	s.stamp(g)
+	return g.Save()
+}
+
+// folderFile is settings.json beside the exe. It exists only while a
+// characters or games folder other than the one beside the exe is in use.
+type folderFile struct {
+	CharsDir string `json:"charactersFolder,omitempty"`
+	GamesDir string `json:"gamesFolder,omitempty"`
+}
+
+// loadFolders uses the folders saved in folderFile, if any.
+func (s *Settings) loadFolders() {
+	if s.home == "" {
+		return
+	}
+	var f folderFile
+	if b, err := os.ReadFile(filepath.Join(s.home, settingsFile)); err == nil {
+		_ = json.Unmarshal(b, &f)
+	}
+	if f.CharsDir != "" {
+		s.CharsDir = f.CharsDir
+	}
+	if f.GamesDir != "" {
+		s.GamesDir = f.GamesDir
+	}
+}
+
+// saveFolders writes the folders that differ from the ones beside the exe to
+// folderFile, or removes it when none do.
+func (s *Settings) saveFolders() error {
+	if s.home == "" {
+		return nil
+	}
+	var f folderFile
+	if !samePath(s.CharsDir, s.found.Characters) {
+		f.CharsDir = s.CharsDir
+	}
+	if !samePath(s.GamesDir, s.found.Games) {
+		f.GamesDir = s.GamesDir
+	}
+	p := filepath.Join(s.home, settingsFile)
+	if f == (folderFile{}) {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	return writeJSON(p, f)
+}
+
+func samePath(a, b string) bool { return strings.EqualFold(filepath.Clean(a), filepath.Clean(b)) }
+
+// stamp copies the setup choices into a game's settings.
+func (s *Settings) stamp(g *GameSettings) {
+	g.Character, g.MicID, g.MicName = s.Character, s.MicID, s.MicName
+}
+
+// gamePath is where a game's settings are kept, or "" with no games folder.
+func (s *Settings) gamePath(game string) string {
+	if s.GamesDir == "" || game == "" {
+		return ""
+	}
+	return filepath.Join(s.GamesDir, game, settingsFolder, settingsFile)
+}
 
 // LoadGameSettings reads one game's file, with defaults if there isn't one.
 func (s *Settings) LoadGameSettings(game string) *GameSettings {
 	g := &GameSettings{
 		IconSize: DefaultIconSize, IconSpacing: DefaultIconSpacing,
 		CharSize: DefaultCharSize, ItemSize: DefaultItemSize, path: s.gamePath(game),
-		// Until set here, the time from settings.json (8 seconds by default).
-		RewardSeconds: s.DisplaySeconds,
+		RewardSeconds: s.rewardSecs,
 		TalkOpenDb:    DefaultTalkOpen, TalkCloseDb: DefaultTalkClose, TalkHoldMs: DefaultTalkHoldMs,
 	}
 	if b, err := os.ReadFile(g.path); err == nil {
 		_ = json.Unmarshal(b, g)
+	} else if s.legacy != "" {
+		if b, err := os.ReadFile(filepath.Join(s.legacy, game+".json")); err == nil {
+			_ = json.Unmarshal(b, g)
+		}
+	}
+	if g.RewardSeconds <= 0 {
+		g.RewardSeconds = defaultRewardSeconds
 	}
 	g.IconSize = clampIconSize(g.IconSize)
 	g.CharSize = clampCharSize(g.CharSize)
@@ -151,22 +260,12 @@ func (s *Settings) LoadGameSettings(game string) *GameSettings {
 	return g
 }
 
-// SavedGames lists the games that have a settings file.
-func (s *Settings) SavedGames() []string {
-	entries, _ := os.ReadDir(s.dir)
-	var games []string
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.EqualFold(filepath.Ext(name), ".json") || name == settingsFile || name == locationFile {
-			continue
-		}
-		games = append(games, strings.TrimSuffix(name, filepath.Ext(name)))
+func (g *GameSettings) Save() error {
+	if g.path == "" {
+		return nil
 	}
-	sort.Slice(games, func(i, j int) bool { return natLess(games[i], games[j]) })
-	return games
+	return writeJSON(g.path, g)
 }
-
-func (g *GameSettings) Save() error { return writeJSON(g.path, g) }
 
 func writeJSON(path string, v any) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -187,25 +286,4 @@ func clampSize(n, lo, hi, def int) int {
 		return def
 	}
 	return min(max(n, lo), hi)
-}
-
-// rememberSettingsDir records the chosen settings folder so it is used again
-// when no "settings" folder sits next to the exe.
-func rememberSettingsDir(dir string) {
-	b, _ := json.Marshal(map[string]string{"settingsDir": dir})
-	_ = os.MkdirAll(appDataDir(), 0o755)
-	_ = os.WriteFile(filepath.Join(appDataDir(), locationFile), b, 0o644)
-}
-
-func rememberedSettingsDir() string {
-	var loc struct {
-		SettingsDir string `json:"settingsDir"`
-	}
-	if b, err := os.ReadFile(filepath.Join(appDataDir(), locationFile)); err == nil {
-		_ = json.Unmarshal(b, &loc)
-	}
-	if loc.SettingsDir != "" && isDir(loc.SettingsDir) {
-		return loc.SettingsDir
-	}
-	return ""
 }

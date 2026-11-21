@@ -20,8 +20,10 @@ import (
 //	games/<game>/icons/0.png           idle item-display image (optional)
 //	games/<game>/gifs/<n>.gif          item animation on click
 //	games/<game>/overlays/<name>.png   images behind everything (optional)
+//	games/<game>/settings/settings.json  the game's tracker settings
 type Game struct {
 	Name     string
+	Dir      string
 	Rows     []Row
 	GifsDir  string
 	IdlePath string
@@ -107,7 +109,7 @@ func ListGames(gamesDir string) ([]string, error) {
 func LoadGame(gamesDir, name string) (*Game, error) {
 	dir := filepath.Join(gamesDir, name)
 	icons := filepath.Join(dir, iconsFolder)
-	g := &Game{Name: name, GifsDir: filepath.Join(dir, gifsFolder)}
+	g := &Game{Name: name, Dir: dir, GifsDir: filepath.Join(dir, gifsFolder)}
 	if p := filepath.Join(icons, "0.png"); fileExists(p) {
 		g.IdlePath = p
 	}
@@ -129,6 +131,17 @@ func LoadGame(gamesDir, name string) (*Game, error) {
 	}
 	g.Overlays = scanOverlays(filepath.Join(dir, overlaysFolder), g.Rows)
 	return g, nil
+}
+
+// MakeGameFolders creates whichever of a game's icons, gifs, overlays and
+// settings folders it doesn't have yet.
+func MakeGameFolders(dir string) error {
+	for _, f := range []string{iconsFolder, gifsFolder, overlaysFolder, settingsFolder} {
+		if err := os.MkdirAll(filepath.Join(dir, f), 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // scanOverlays lists the images in a game's overlays folder, which is

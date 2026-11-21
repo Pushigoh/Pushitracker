@@ -32,6 +32,9 @@ func main() {
 			if sel == nil {
 				break
 			}
+			if sel.Game.Dir != "" {
+				_ = MakeGameFolders(sel.Game.Dir)
+			}
 			t := NewTracker(sel)
 			runTracker(t)
 			if !t.ChangeGame {
