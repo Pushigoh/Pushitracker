@@ -54,8 +54,9 @@ func detectIn(dir string) Detected {
 	return d
 }
 
-// startupSettings finds the characters and games folders, beside the exe
-// unless others were picked with Browse, and starts on the game saved last.
+// startupSettings reads settings.json beside the exe, writing it if it isn't
+// there, finds the characters and games folders, beside the exe unless others
+// were picked with Browse, and starts on the game saved last.
 func startupSettings() *Settings { return settingsBeside(exeDir()) }
 
 func settingsBeside(dir string) *Settings {
@@ -77,7 +78,10 @@ func settingsBeside(dir string) *Settings {
 		s.Character, s.MicID, s.MicName = old.Character, old.MicID, old.MicName
 		s.rewardSecs = old.DisplaySeconds
 	}
-	s.loadFolders()
+	s.loadShared()
+	if !fileExists(filepath.Join(dir, settingsFile)) {
+		_ = s.SaveShared()
+	}
 	game := s.lastGame()
 	if game == "" {
 		game = old.Game

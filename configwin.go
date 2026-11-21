@@ -289,14 +289,9 @@ func (c *configWindow) update(gtx layout.Context, w *app.Window) bool {
 	}
 	for _, g := range c.games {
 		if g.click.Clicked(gtx) {
-			mic := s.MicID
 			s.SelectGame(g.name)
 			if s.savedChoices {
 				c.noChar = s.ChoseNoCharacter()
-			}
-			if s.MicID != mic {
-				c.micMissing = micMissing(s.MicID)
-				c.startMic(w)
 			}
 			c.rescan()
 		}

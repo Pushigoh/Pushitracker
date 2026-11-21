@@ -40,11 +40,11 @@ const (
 	MaxOverlaySize    = 400
 )
 
-// Settings are the setup choices. The character and microphone are saved
-// with each game (see GameSettings), and setup starts on the game saved last.
-// The games and characters folders are the ones beside the exe, unless others
-// have been picked with Browse: only then is a settings.json kept beside the
-// exe, holding just those folders (see folderFile).
+// Settings are the setup choices. The character is saved with each game (see
+// GameSettings), and setup starts on the game saved last. The microphone is
+// kept in settings.json beside the exe, with the characters and games folders
+// if others than the ones beside the exe were picked with Browse (see
+// sharedFile).
 type Settings struct {
 	CharsDir  string
 	GamesDir  string
@@ -55,7 +55,7 @@ type Settings struct {
 	MicID   string
 	MicName string
 
-	home  string   // the exe's folder, where folderFile goes ("" for none)
+	home  string   // the exe's folder, where sharedFile goes ("" for none)
 	found Detected // the folders found beside the exe
 	// The settings folder older versions kept beside the exe, with every
 	// game's file in it: a game's file there is read until the game saves
@@ -98,11 +98,8 @@ type GameSettings struct {
 	// Overlays shown at other than their own size, in percent, by file name.
 	OverlaySize map[string]int `json:"overlaySizes,omitempty"`
 
-	// The choices made in setup for this game: the character ("" for none)
-	// and the mic.
+	// The character chosen in setup for this game ("" for none).
 	Character string `json:"character"`
-	MicID     string `json:"microphone,omitempty"`
-	MicName   string `json:"microphoneName,omitempty"`
 
 	path string
 }
@@ -121,8 +118,8 @@ type legacySettings struct {
 // defaultRewardSeconds is how long a reward shows until a game sets its own.
 const defaultRewardSeconds = 8
 
-// SelectGame picks a game, and the character and mic saved with it if it has
-// any; otherwise the current ones stay.
+// SelectGame picks a game, and the character saved with it if it has one;
+// otherwise the current one stays.
 func (s *Settings) SelectGame(name string) {
 	s.Game, s.savedChoices = name, false
 	p := s.gamePath(name)
@@ -130,8 +127,7 @@ func (s *Settings) SelectGame(name string) {
 		return
 	}
 	g := s.LoadGameSettings(name)
-	s.Character, s.MicID, s.MicName = g.Character, g.MicID, g.MicName
-	s.savedChoices = true
+	s.Character, s.savedChoices = g.Character, true
 }
 
 // ChoseNoCharacter reports whether the game was saved with no character.
@@ -150,10 +146,9 @@ func (s *Settings) lastGame() string {
 	return last
 }
 
-// Save writes the setup choices into the chosen game's settings, and the
-// folders into folderFile if they aren't the ones beside the exe.
+// Save writes sharedFile and the character into the chosen game's settings.
 func (s *Settings) Save() error {
-	if err := s.saveFolders(); err != nil {
+	if err := s.SaveShared(); err != nil {
 		return err
 	}
 	if s.Game == "" {
@@ -164,59 +159,54 @@ func (s *Settings) Save() error {
 	return g.Save()
 }
 
-// folderFile is settings.json beside the exe. It exists only while a
-// characters or games folder other than the one beside the exe is in use.
-type folderFile struct {
+// sharedFile is settings.json beside the exe: the microphone, and the
+// characters and games folders when they aren't the ones beside the exe.
+type sharedFile struct {
 	CharsDir string `json:"charactersFolder,omitempty"`
 	GamesDir string `json:"gamesFolder,omitempty"`
+	MicID    string `json:"microphone"`
+	MicName  string `json:"microphoneName"`
 }
 
-// loadFolders uses the folders saved in folderFile, if any.
-func (s *Settings) loadFolders() {
+// loadShared reads sharedFile, if there is one.
+func (s *Settings) loadShared() {
 	if s.home == "" {
 		return
 	}
-	var f folderFile
-	if b, err := os.ReadFile(filepath.Join(s.home, settingsFile)); err == nil {
-		_ = json.Unmarshal(b, &f)
+	b, err := os.ReadFile(filepath.Join(s.home, settingsFile))
+	if err != nil {
+		return
 	}
+	var f sharedFile
+	_ = json.Unmarshal(b, &f)
 	if f.CharsDir != "" {
 		s.CharsDir = f.CharsDir
 	}
 	if f.GamesDir != "" {
 		s.GamesDir = f.GamesDir
 	}
+	s.MicID, s.MicName = f.MicID, f.MicName
 }
 
-// saveFolders writes the folders that differ from the ones beside the exe to
-// folderFile, or removes it when none do.
-func (s *Settings) saveFolders() error {
+// SaveShared writes sharedFile.
+func (s *Settings) SaveShared() error {
 	if s.home == "" {
 		return nil
 	}
-	var f folderFile
+	f := sharedFile{MicID: s.MicID, MicName: s.MicName}
 	if !samePath(s.CharsDir, s.found.Characters) {
 		f.CharsDir = s.CharsDir
 	}
 	if !samePath(s.GamesDir, s.found.Games) {
 		f.GamesDir = s.GamesDir
 	}
-	p := filepath.Join(s.home, settingsFile)
-	if f == (folderFile{}) {
-		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		return nil
-	}
-	return writeJSON(p, f)
+	return writeJSON(filepath.Join(s.home, settingsFile), f)
 }
 
 func samePath(a, b string) bool { return strings.EqualFold(filepath.Clean(a), filepath.Clean(b)) }
 
 // stamp copies the setup choices into a game's settings.
-func (s *Settings) stamp(g *GameSettings) {
-	g.Character, g.MicID, g.MicName = s.Character, s.MicID, s.MicName
-}
+func (s *Settings) stamp(g *GameSettings) { g.Character = s.Character }
 
 // gamePath is where a game's settings are kept, or "" with no games folder.
 func (s *Settings) gamePath(game string) string {

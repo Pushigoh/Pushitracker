@@ -21,6 +21,7 @@ Put these next to `pushitracker.exe`:
 
 ```
 pushitracker.exe
+settings.json       made on first run: the microphone, and folders picked with Browse
 characters/
   <character>/      optional; each image can be a .gif, .png or .jpg
     idle.gif        shown at rest
@@ -42,10 +43,10 @@ games/
       <n>.png, <n>-1.png, <n>-2.png   named like an icon's stages: shown while the icon is on that stage
       <n>-0.png     shown while icon <n> isn't collected; without it, its first stage shows in grey
     settings/
-      settings.json the game's character, microphone, sizes and positions
+      settings.json the game's character, sizes and positions
 ```
 
-Settings are saved in each game's folder. The one exception: if you use Browse in setup to pick a characters or games folder other than the ones next to `pushitracker.exe`, a `settings.json` next to it remembers those folders. Starting a game creates whichever of its `icons`, `gifs`, `overlays` and `settings` folders are missing. Setup opens on the game you played last, with the character and microphone you used for it.
+Each game's settings are saved in its own folder. A `settings.json` next to `pushitracker.exe` keeps the microphone, and any characters or games folder you picked with Browse in setup instead of the ones next to the exe. Starting a game creates whichever of its `icons`, `gifs`, `overlays` and `settings` folders are missing. Setup opens on the game you played last, with the character you used for it.
 
 Icons can have any name; the same name finds the icon's gif, the character's image and the icon's overlays. Icons, rows and overlays are sorted alphabetically, ignoring case, with numbers in order (2 before 10).
 

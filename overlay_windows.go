@@ -905,7 +905,7 @@ func (o *overlay) current() GameSettings {
 }
 
 // snapshot is what Save would write, to compare with what was: this game's
-// settings and the mic, which is saved with them.
+// settings and the mic, which is kept in settings.json beside the exe.
 func (o *overlay) snapshot() []byte {
 	b, _ := json.Marshal(struct {
 		Game GameSettings
@@ -914,10 +914,12 @@ func (o *overlay) snapshot() []byte {
 	return b
 }
 
-// save writes this game's settings file, mic included.
+// save writes this game's settings file, and settings.json beside the exe
+// for the mic.
 func (o *overlay) save() {
 	*o.t.gs = o.current()
 	o.t.SaveGame()
+	_ = o.t.settings.SaveShared()
 	o.saved = o.snapshot()
 }
 
