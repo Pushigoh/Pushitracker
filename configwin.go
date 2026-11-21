@@ -60,7 +60,6 @@ type pickKind int
 const (
 	pickChars pickKind = iota
 	pickGames
-	pickSettings
 )
 
 type pick struct {
@@ -78,27 +77,25 @@ type configWindow struct {
 	th       *material.Theme
 	settings *Settings
 
-	chars     []*choice
-	charsErr  error
-	charGifs  int
-	games     []*choice
-	gamesErr  error
-	game      *Game
-	gameErr   error
-	gameIcon  int    // the selected game's saved icon size
-	settingsN string // short description of the settings folder state
+	chars    []*choice
+	charsErr error
+	charGifs int
+	games    []*choice
+	gamesErr error
+	game     *Game
+	gameErr  error
+	gameIcon int // the selected game's saved icon size
 
 	browsing bool
 	picked   chan pick
 
-	charsBtn    widget.Clickable
-	gamesBtn    widget.Clickable
-	settingsBtn widget.Clickable
-	startBtn    widget.Clickable
-	micBtn      widget.Clickable
-	micOpen     bool // the mic picker is open
-	micPicked   chan micPick
-	micMissing  bool // the chosen mic isn't plugged in
+	charsBtn   widget.Clickable
+	gamesBtn   widget.Clickable
+	startBtn   widget.Clickable
+	micBtn     widget.Clickable
+	micOpen    bool // the mic picker is open
+	micPicked  chan micPick
+	micMissing bool // the chosen mic isn't plugged in
 	// The chosen mic's level (dBFS bits) for its level bar, and how to stop
 	// capturing it (nil when not).
 	micLevel              atomic.Uint64
@@ -110,11 +107,11 @@ type configWindow struct {
 }
 
 // runConfigWindow shows the setup window and blocks until it closes. It
-// returns nil if the window was closed without pressing Start. s may be
-// replaced when another settings folder is picked.
+// returns nil if the window was closed without pressing Start.
 func runConfigWindow(th *material.Theme, s *Settings) *Selection {
 	c := &configWindow{th: th, settings: s, picked: make(chan pick, 1), micPicked: make(chan micPick, 1)}
 	c.micMissing = micMissing(s.MicID)
+	c.noChar = s.ChoseNoCharacter()
 	defer c.stopMic()
 	c.list.Axis = layout.Vertical
 	c.rescan()
@@ -179,15 +176,6 @@ func (c *configWindow) rescan() {
 		c.gameIcon, c.micOpenDb, c.micCloseDb = gs.IconSize, gs.TalkOpenDb, min(gs.TalkCloseDb, gs.TalkOpenDb)
 	}
 
-	c.settingsN = "Will be created on Start"
-	if saved := s.SavedGames(); len(saved) > 0 {
-		for i := range saved {
-			saved[i] = strings.ToUpper(saved[i])
-		}
-		c.settingsN = "Saved settings for " + strings.Join(saved, ", ")
-	} else if fileExists(filepath.Join(s.Dir(), settingsFile)) {
-		c.settingsN = "No game settings saved yet"
-	}
 }
 
 // reuseChoices builds buttons for names, keeping existing buttons (and so
@@ -243,23 +231,6 @@ func (c *configWindow) applyPick(p pick) {
 		s.CharsDir = p.dir
 	case pickGames:
 		s.GamesDir = p.dir
-	case pickSettings:
-		// Take everything saved in the new folder, but keep folders already
-		// chosen here.
-		loaded := LoadSettings(p.dir)
-		if s.CharsDir != "" {
-			loaded.CharsDir = s.CharsDir
-		}
-		if s.GamesDir != "" {
-			loaded.GamesDir = s.GamesDir
-		}
-		if loaded.Character == "" {
-			loaded.Character = s.Character
-		}
-		if loaded.Game == "" {
-			loaded.Game = s.Game
-		}
-		*s = *loaded
 	}
 	c.rescan()
 }
@@ -304,9 +275,6 @@ func (c *configWindow) update(gtx layout.Context, w *app.Window) bool {
 		if c.gamesBtn.Clicked(gtx) {
 			c.browse(w, pickGames, s.GamesDir, "Choose the games folder (contains a folder per game)")
 		}
-		if c.settingsBtn.Clicked(gtx) {
-			c.browse(w, pickSettings, s.Dir(), "Choose the settings folder")
-		}
 	}
 	for _, ch := range c.chars {
 		if ch.click.Clicked(gtx) {
@@ -321,13 +289,15 @@ func (c *configWindow) update(gtx layout.Context, w *app.Window) bool {
 	}
 	for _, g := range c.games {
 		if g.click.Clicked(gtx) {
-			s.Game = g.name
+			s.SelectGame(g.name)
+			if s.savedChoices {
+				c.noChar = s.ChoseNoCharacter()
+			}
 			c.rescan()
 		}
 	}
 	if c.startBtn.Clicked(gtx) && c.canStart() {
 		_ = s.Save()
-		rememberSettingsDir(s.Dir())
 		return true
 	}
 	return false
@@ -422,10 +392,6 @@ func (c *configWindow) layout(gtx layout.Context) layout.Dimensions {
 		layout.Rigid(c.pathRow(s.GamesDir, &c.gamesBtn)),
 		buttons(c.games, s.Game),
 		status(firstErr(c.gamesErr, c.gameErr), gameStatus),
-
-		heading("Settings"),
-		layout.Rigid(c.pathRow(s.Dir(), &c.settingsBtn)),
-		status(nil, c.settingsN),
 	}
 
 	return layout.UniformInset(18).Layout(gtx, func(gtx layout.Context) layout.Dimensions {

@@ -496,7 +496,10 @@ func (t *Tracker) Game() *GameSettings { return t.gs }
 
 // SaveGame writes this game's settings file. The window calls it for the
 // panel's Save button, after recording where everything is.
-func (t *Tracker) SaveGame() { _ = t.gs.Save() }
+func (t *Tracker) SaveGame() {
+	t.settings.stamp(t.gs)
+	_ = t.gs.Save()
+}
 
 // closePanel closes the settings panel. Changes stay for this session but
 // are only written to disk by Save.
